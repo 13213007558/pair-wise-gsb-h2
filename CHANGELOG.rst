@@ -1,6 +1,19 @@
 Release History
 ===============
 
+4.4.2 (unreleased)
+------------------
+
+**Bugfixes**
+
+- Fix SETTINGS acknowledgement boundaries: a single SETTINGS ACK now applies
+  the changes from exactly one outstanding SETTINGS frame, in send order.
+  Previously, one ACK incorrectly applied the changes from all in-flight
+  SETTINGS frames at once. The initial SETTINGS frame and empty SETTINGS
+  frames each occupy their own acknowledgement slot, and
+  ``INITIAL_WINDOW_SIZE`` changes adjust the flow control windows of
+  existing streams one frame at a time.
+
 4.4.1 (2026-08-03)
 ------------------
 

@@ -536,6 +536,11 @@ class H2Connection:
 
         self._data_to_send += preamble + f.serialize()
 
+        # The initial SETTINGS frame only carries values that are already
+        # in effect, but it still occupies a slot in the acknowledgement
+        # queue: its ACK must not consume changes sent in later frames.
+        self.local_settings._register_empty_frame()
+
     def initiate_upgrade_connection(self, settings_header: bytes | None = None) -> bytes | None:
         """
         Call to initialise the connection object for use with an upgraded

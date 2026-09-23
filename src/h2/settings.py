@@ -117,6 +117,11 @@ class Settings(MutableMapping[SettingCodes | int, int]):
     .. versionchanged:: 2.5.0
        Added the ``max_header_list_size`` property.
 
+    .. versionchanged:: 4.4.2
+       Each acknowledgement now applies the changes from exactly one
+       outstanding SETTINGS frame, instead of applying all outstanding
+       changes at once.
+
     :param client: (optional) Whether these settings should be defaulted for a
         client implementation or a server implementation. Defaults to ``True``.
     :type client: ``bool``
@@ -141,6 +146,16 @@ class Settings(MutableMapping[SettingCodes | int, int]):
             SettingCodes.MAX_FRAME_SIZE: collections.deque([16384]),
             SettingCodes.ENABLE_CONNECT_PROTOCOL: collections.deque([0]),
         }
+
+        # Queue of unacknowledged SETTINGS frames. Each entry is a dictionary
+        # of {setting: value} carried by a single sent (or received) SETTINGS
+        # frame, in the order those frames were sent (or received). Each
+        # acknowledgement consumes exactly one entry: this ensures that a
+        # single ACK only ever applies the changes from a single SETTINGS
+        # frame, even when multiple frames are in flight. Empty SETTINGS
+        # frames occupy their own slot in this queue.
+        self._pending_frames: collections.deque[dict[SettingCodes | int, int]] = collections.deque()
+
         if initial_values is not None:
             for key, value in initial_values.items():
                 invalid = _validate_setting(key, value)
@@ -157,21 +172,66 @@ class Settings(MutableMapping[SettingCodes | int, int]):
         The settings have been acknowledged, either by the user (remote
         settings) or by the remote peer (local settings).
 
+        A single acknowledgement applies the changes from exactly one
+        outstanding SETTINGS frame: the oldest one. Settings that were not
+        changed by that frame keep their current values, and changes carried
+        by later frames remain pending until their own acknowledgement
+        arrives.
+
         :returns: A dict of {setting: ChangedSetting} that were applied.
         """
         changed_settings: dict[SettingCodes | int, ChangedSetting] = {}
 
-        # If there is more than one setting in the list, we have a setting
-        # value outstanding. Update them.
-        for k, v in self._settings.items():
-            if len(v) > 1:
-                old_setting = v.popleft()
-                new_setting = v[0]
-                changed_settings[k] = ChangedSetting(
-                    k, old_setting, new_setting,
-                )
+        if not self._pending_frames:
+            return changed_settings
+
+        frame = self._pending_frames.popleft()
+        for setting in frame:
+            code = _setting_code_from_int(setting)
+            values = self._settings.get(setting)
+            if values is None or len(values) < 2:
+                # The pending value was deleted before it could be
+                # acknowledged: there is nothing to apply.
+                continue
+            old_setting = values.popleft()
+            new_setting = values[0]
+            changed_settings[code] = ChangedSetting(
+                code, old_setting, new_setting,
+            )
 
         return changed_settings
+
+    def _register_empty_frame(self) -> None:
+        """
+        Record that a SETTINGS frame carrying no pending changes was sent.
+
+        This is used for frames whose values are already in effect (such as
+        the initial SETTINGS frame sent at connection startup): the frame
+        still occupies a slot in the acknowledgement queue so that its ACK
+        does not consume changes from later frames.
+        """
+        self._pending_frames.append({})
+
+    def _set_pending_value(self, key: SettingCodes | int, value: int) -> None:
+        """
+        Validate and queue a new pending value for a setting, without
+        associating it with a SETTINGS frame.
+        """
+        invalid = _validate_setting(key, value)
+        if invalid:
+            msg = f"Setting {key} has invalid value {value}"
+            raise InvalidSettingsValueError(
+                msg,
+                error_code=invalid,
+            )
+
+        try:
+            items = self._settings[key]
+        except KeyError:
+            items = collections.deque([None])  # type: ignore
+            self._settings[key] = items
+
+        items.append(value)
 
     # Provide easy-access to well known settings.
     @property
@@ -273,21 +333,29 @@ class Settings(MutableMapping[SettingCodes | int, int]):
         return val
 
     def __setitem__(self, key: SettingCodes | int, value: int) -> None:
-        invalid = _validate_setting(key, value)
-        if invalid:
-            msg = f"Setting {key} has invalid value {value}"
-            raise InvalidSettingsValueError(
-                msg,
-                error_code=invalid,
-            )
+        self._set_pending_value(key, value)
 
-        try:
-            items = self._settings[key]
-        except KeyError:
-            items = collections.deque([None])  # type: ignore
-            self._settings[key] = items
+        # Associate the change with the most recent unacknowledged frame,
+        # so that it is applied when that frame is acknowledged. If no frame
+        # is outstanding, begin a new one.
+        if not self._pending_frames:
+            self._pending_frames.append({})
+        self._pending_frames[-1][key] = value
 
-        items.append(value)
+    def update(self, other=(), **kwargs: int) -> None:  # type: ignore[override]
+        """
+        Apply a collection of new settings values as a single SETTINGS
+        frame.
+
+        All values given in one call to this method are treated as belonging
+        to the same SETTINGS frame: a single acknowledgement will apply all
+        of them together, and no acknowledgement will apply any of them
+        before the changes from earlier frames.
+        """
+        frame_settings: dict[SettingCodes | int, int] = dict(other, **kwargs)
+        for key, value in frame_settings.items():
+            self._set_pending_value(key, value)
+        self._pending_frames.append(frame_settings)
 
     def validate_received_setting(self, setting: SettingCodes | int, value: int) -> None:
         """

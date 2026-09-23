@@ -681,6 +681,16 @@ class TestBasicClient:
         event = events[0]
 
         assert isinstance(event, h2.events.SettingsAcknowledged)
+        assert not event.changed_settings
+
+        # The first ACK acknowledges the initial SETTINGS frame. The second
+        # acknowledges the settings update.
+        events = c.receive_data(f.serialize())
+
+        assert len(events) == 1
+        event = events[0]
+
+        assert isinstance(event, h2.events.SettingsAcknowledged)
         assert len(event.changed_settings) == len(new_settings)
         for setting, value in new_settings.items():
             assert event.changed_settings[setting].new_value == value
@@ -883,6 +893,9 @@ class TestBasicClient:
             {h2.settings.SettingCodes.MAX_FRAME_SIZE: frame_size},
         )
         settings_ack = frame_factory.build_settings_frame({}, ack=True)
+        # The first ACK acknowledges the initial SETTINGS frame, the second
+        # acknowledges the MAX_FRAME_SIZE change.
+        c.receive_data(settings_ack.serialize())
         c.receive_data(settings_ack.serialize())
 
         # Greatly increase the flow control windows: we're not here to test

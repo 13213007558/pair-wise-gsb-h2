@@ -717,6 +717,9 @@ class TestAutomaticFlowControl:
         settings_frame = frame_factory.build_settings_frame(
             settings={}, ack=True,
         )
+        # The first ACK acknowledges the initial SETTINGS frame, the
+        # second acknowledges the MAX_FRAME_SIZE change.
+        c.receive_data(settings_frame.serialize())
         c.receive_data(settings_frame.serialize())
         c.clear_outbound_data_buffer()
 

@@ -8,6 +8,9 @@ from hypothesis import assume, given
 from hypothesis.strategies import booleans, builds, fixed_dictionaries, integers
 
 import h2.errors
+import h2.config
+import h2.connection
+import h2.events
 import h2.exceptions
 import h2.settings
 
@@ -219,6 +222,79 @@ class TestSettings:
 
         s.acknowledge()
         assert s[h2.settings.SettingCodes.HEADER_TABLE_SIZE] == 4096
+
+    def test_acknowledgement_applies_one_frame_at_a_time(self) -> None:
+        """
+        Each acknowledgement applies the changes from exactly one
+        outstanding SETTINGS frame: the oldest one.
+        """
+        s = h2.settings.Settings(client=True)
+        s.update({h2.settings.SettingCodes.HEADER_TABLE_SIZE: 100})
+        s.update({h2.settings.SettingCodes.MAX_FRAME_SIZE: 32768})
+
+        changes = s.acknowledge()
+        assert list(changes) == [h2.settings.SettingCodes.HEADER_TABLE_SIZE]
+        change = changes[h2.settings.SettingCodes.HEADER_TABLE_SIZE]
+        assert change.original_value == 4096
+        assert change.new_value == 100
+        assert s.header_table_size == 100
+        assert s.max_frame_size == 16384
+
+        changes = s.acknowledge()
+        assert list(changes) == [h2.settings.SettingCodes.MAX_FRAME_SIZE]
+        change = changes[h2.settings.SettingCodes.MAX_FRAME_SIZE]
+        assert change.original_value == 16384
+        assert change.new_value == 32768
+        assert s.max_frame_size == 32768
+
+    def test_acknowledgement_same_setting_consecutive_frames(self) -> None:
+        """
+        A setting changed in consecutive frames takes effect one frame at a
+        time.
+        """
+        s = h2.settings.Settings(client=True)
+        s.update({h2.settings.SettingCodes.INITIAL_WINDOW_SIZE: 100})
+        s.update({h2.settings.SettingCodes.INITIAL_WINDOW_SIZE: 200})
+
+        changes = s.acknowledge()
+        assert list(changes) == [h2.settings.SettingCodes.INITIAL_WINDOW_SIZE]
+        change = changes[h2.settings.SettingCodes.INITIAL_WINDOW_SIZE]
+        assert change.original_value == 65535
+        assert change.new_value == 100
+        assert s.initial_window_size == 100
+
+        changes = s.acknowledge()
+        assert list(changes) == [h2.settings.SettingCodes.INITIAL_WINDOW_SIZE]
+        change = changes[h2.settings.SettingCodes.INITIAL_WINDOW_SIZE]
+        assert change.original_value == 100
+        assert change.new_value == 200
+        assert s.initial_window_size == 200
+
+    def test_empty_frame_occupies_acknowledgement_slot(self) -> None:
+        """
+        An empty SETTINGS frame consumes one acknowledgement without
+        applying any changes.
+        """
+        s = h2.settings.Settings(client=True)
+        s.update({})
+        s.update({h2.settings.SettingCodes.HEADER_TABLE_SIZE: 100})
+
+        assert s.acknowledge() == {}
+        assert s.header_table_size == 4096
+
+        changes = s.acknowledge()
+        assert list(changes) == [h2.settings.SettingCodes.HEADER_TABLE_SIZE]
+        assert s.header_table_size == 100
+
+    def test_acknowledgement_with_nothing_outstanding(self) -> None:
+        """
+        An acknowledgement with no outstanding SETTINGS frames changes
+        nothing.
+        """
+        s = h2.settings.Settings(client=True)
+
+        assert s.acknowledge() == {}
+        assert s.header_table_size == 4096
 
     def test_settings_getters(self) -> None:
         """
@@ -464,3 +540,260 @@ class TestSettingsEquality:
         delg = Delegate()
         assert (settings == delg) == [delg]
         assert (settings != delg) == [delg]
+
+
+class TestConnectionSettingsAcknowledgement:
+    """
+    Test that a connection applies acknowledged settings one SETTINGS frame
+    at a time, in the order the frames were sent.
+    """
+
+    example_request_headers = [
+        (":authority", "example.com"),
+        (":path", "/"),
+        (":scheme", "https"),
+        (":method", "GET"),
+    ]
+
+    def _initiate_connection(self, frame_factory, client):
+        """
+        Return a connection, either client- or server-side, that has sent
+        its initial SETTINGS frame.
+        """
+        if client:
+            c = h2.connection.H2Connection()
+        else:
+            config = h2.config.H2Configuration(client_side=False)
+            c = h2.connection.H2Connection(config=config)
+        c.initiate_connection()
+        if not client:
+            c.receive_data(frame_factory.preamble())
+        c.clear_outbound_data_buffer()
+        return c
+
+    def _open_stream(self, frame_factory, c, client):
+        """
+        Open stream 1 so that its flow control window can be observed.
+        """
+        if client:
+            c.send_headers(1, self.example_request_headers, end_stream=True)
+        else:
+            f = frame_factory.build_headers_frame(
+                self.example_request_headers,
+            )
+            c.receive_data(f.serialize())
+        c.clear_outbound_data_buffer()
+
+    @pytest.mark.parametrize("client", [True, False])
+    def test_two_frames_different_settings(self, frame_factory, client) -> None:
+        """
+        Two SETTINGS frames changing different settings are applied by two
+        separate ACKs, one frame at a time.
+        """
+        c = self._initiate_connection(frame_factory, client)
+
+        c.update_settings({h2.settings.SettingCodes.HEADER_TABLE_SIZE: 100})
+        c.update_settings({h2.settings.SettingCodes.MAX_FRAME_SIZE: 32768})
+        c.clear_outbound_data_buffer()
+
+        ack = frame_factory.build_settings_frame({}, ack=True).serialize()
+
+        # The first ACK acknowledges the initial SETTINGS frame: nothing
+        # changes.
+        events = c.receive_data(ack)
+        assert len(events) == 1
+        assert isinstance(events[0], h2.events.SettingsAcknowledged)
+        assert events[0].changed_settings == {}
+        assert c.local_settings.header_table_size == 4096
+        assert c.local_settings.max_frame_size == 16384
+        assert c.max_inbound_frame_size == 16384
+
+        # The second ACK applies only the HEADER_TABLE_SIZE change.
+        events = c.receive_data(ack)
+        assert len(events) == 1
+        changes = events[0].changed_settings
+        assert list(changes) == [h2.settings.SettingCodes.HEADER_TABLE_SIZE]
+        change = changes[h2.settings.SettingCodes.HEADER_TABLE_SIZE]
+        assert change.original_value == 4096
+        assert change.new_value == 100
+        assert c.local_settings.header_table_size == 100
+        assert c.local_settings.max_frame_size == 16384
+        assert c.max_inbound_frame_size == 16384
+
+        # The third ACK applies only the MAX_FRAME_SIZE change.
+        events = c.receive_data(ack)
+        assert len(events) == 1
+        changes = events[0].changed_settings
+        assert list(changes) == [h2.settings.SettingCodes.MAX_FRAME_SIZE]
+        change = changes[h2.settings.SettingCodes.MAX_FRAME_SIZE]
+        assert change.original_value == 16384
+        assert change.new_value == 32768
+        assert c.local_settings.max_frame_size == 32768
+        assert c.max_inbound_frame_size == 32768
+
+    @pytest.mark.parametrize("client", [True, False])
+    def test_same_setting_changed_in_consecutive_frames(self, frame_factory, client) -> None:
+        """
+        A setting changed in consecutive SETTINGS frames takes effect one
+        frame at a time, adjusting existing streams' windows each time.
+        """
+        c = self._initiate_connection(frame_factory, client)
+        self._open_stream(frame_factory, c, client)
+        assert c.remote_flow_control_window(1) == 65535
+
+        c.update_settings(
+            {h2.settings.SettingCodes.INITIAL_WINDOW_SIZE: 1000},
+        )
+        c.update_settings(
+            {h2.settings.SettingCodes.INITIAL_WINDOW_SIZE: 2000},
+        )
+        c.clear_outbound_data_buffer()
+
+        ack = frame_factory.build_settings_frame({}, ack=True).serialize()
+
+        # The first ACK acknowledges the initial SETTINGS frame: nothing
+        # changes.
+        events = c.receive_data(ack)
+        assert events[0].changed_settings == {}
+        assert c.local_settings.initial_window_size == 65535
+        assert c.remote_flow_control_window(1) == 65535
+
+        # The second ACK applies the first INITIAL_WINDOW_SIZE change.
+        events = c.receive_data(ack)
+        changes = events[0].changed_settings
+        assert list(changes) == [h2.settings.SettingCodes.INITIAL_WINDOW_SIZE]
+        change = changes[h2.settings.SettingCodes.INITIAL_WINDOW_SIZE]
+        assert change.original_value == 65535
+        assert change.new_value == 1000
+        assert c.local_settings.initial_window_size == 1000
+        assert c.remote_flow_control_window(1) == 1000
+
+        # The third ACK applies the second INITIAL_WINDOW_SIZE change.
+        events = c.receive_data(ack)
+        changes = events[0].changed_settings
+        assert list(changes) == [h2.settings.SettingCodes.INITIAL_WINDOW_SIZE]
+        change = changes[h2.settings.SettingCodes.INITIAL_WINDOW_SIZE]
+        assert change.original_value == 1000
+        assert change.new_value == 2000
+        assert c.local_settings.initial_window_size == 2000
+        assert c.remote_flow_control_window(1) == 2000
+
+    @pytest.mark.parametrize("client", [True, False])
+    def test_empty_settings_frame_has_own_acknowledgement(self, frame_factory, client) -> None:
+        """
+        An empty SETTINGS frame occupies its own acknowledgement slot: its
+        ACK does not apply changes from later frames.
+        """
+        c = self._initiate_connection(frame_factory, client)
+
+        c.update_settings({})
+        c.update_settings({h2.settings.SettingCodes.HEADER_TABLE_SIZE: 100})
+        c.clear_outbound_data_buffer()
+
+        ack = frame_factory.build_settings_frame({}, ack=True).serialize()
+
+        # The first ACK acknowledges the initial SETTINGS frame.
+        events = c.receive_data(ack)
+        assert events[0].changed_settings == {}
+
+        # The second ACK acknowledges the empty SETTINGS frame: nothing
+        # changes.
+        events = c.receive_data(ack)
+        assert events[0].changed_settings == {}
+        assert c.local_settings.header_table_size == 4096
+
+        # The third ACK applies the HEADER_TABLE_SIZE change.
+        events = c.receive_data(ack)
+        changes = events[0].changed_settings
+        assert list(changes) == [h2.settings.SettingCodes.HEADER_TABLE_SIZE]
+        assert c.local_settings.header_table_size == 100
+
+    @pytest.mark.parametrize("client", [True, False])
+    def test_ack_with_nothing_outstanding(self, frame_factory, client) -> None:
+        """
+        An ACK received when no SETTINGS frame is awaiting acknowledgement
+        changes nothing and does not error.
+        """
+        c = self._initiate_connection(frame_factory, client)
+
+        ack = frame_factory.build_settings_frame({}, ack=True).serialize()
+
+        # Acknowledge the initial SETTINGS frame.
+        events = c.receive_data(ack)
+        assert events[0].changed_settings == {}
+
+        # A further ACK has nothing to acknowledge.
+        events = c.receive_data(ack)
+        assert len(events) == 1
+        assert isinstance(events[0], h2.events.SettingsAcknowledged)
+        assert events[0].changed_settings == {}
+        assert c.local_settings.header_table_size == 4096
+
+    @pytest.mark.parametrize("client", [True, False])
+    def test_received_frames_apply_in_order(self, frame_factory, client) -> None:
+        """
+        Received SETTINGS frames take effect one frame at a time, emitting
+        one event per frame and adjusting existing streams' windows by each
+        frame's delta.
+        """
+        c = self._initiate_connection(frame_factory, client)
+        self._open_stream(frame_factory, c, client)
+        assert c.local_flow_control_window(1) == 65535
+
+        # The first frame changes HEADER_TABLE_SIZE only.
+        f = frame_factory.build_settings_frame(
+            {h2.settings.SettingCodes.HEADER_TABLE_SIZE: 100},
+        )
+        events = c.receive_data(f.serialize())
+        assert len(events) == 1
+        assert isinstance(events[0], h2.events.RemoteSettingsChanged)
+        changes = events[0].changed_settings
+        assert list(changes) == [h2.settings.SettingCodes.HEADER_TABLE_SIZE]
+        change = changes[h2.settings.SettingCodes.HEADER_TABLE_SIZE]
+        assert change.original_value == 4096
+        assert change.new_value == 100
+        assert c.remote_settings.header_table_size == 100
+        assert c.remote_settings.max_frame_size == 16384
+        assert c.max_outbound_frame_size == 16384
+
+        # The second frame changes MAX_FRAME_SIZE only.
+        f = frame_factory.build_settings_frame(
+            {h2.settings.SettingCodes.MAX_FRAME_SIZE: 32768},
+        )
+        events = c.receive_data(f.serialize())
+        assert len(events) == 1
+        changes = events[0].changed_settings
+        assert list(changes) == [h2.settings.SettingCodes.MAX_FRAME_SIZE]
+        change = changes[h2.settings.SettingCodes.MAX_FRAME_SIZE]
+        assert change.original_value == 16384
+        assert change.new_value == 32768
+        assert c.remote_settings.max_frame_size == 32768
+        assert c.max_outbound_frame_size == 32768
+
+        # Two consecutive frames change INITIAL_WINDOW_SIZE: the stream
+        # window follows each frame's delta.
+        f = frame_factory.build_settings_frame(
+            {h2.settings.SettingCodes.INITIAL_WINDOW_SIZE: 1000},
+        )
+        events = c.receive_data(f.serialize())
+        assert len(events) == 1
+        changes = events[0].changed_settings
+        assert list(changes) == [h2.settings.SettingCodes.INITIAL_WINDOW_SIZE]
+        change = changes[h2.settings.SettingCodes.INITIAL_WINDOW_SIZE]
+        assert change.original_value == 65535
+        assert change.new_value == 1000
+        assert c.remote_settings.initial_window_size == 1000
+        assert c.local_flow_control_window(1) == 1000
+
+        f = frame_factory.build_settings_frame(
+            {h2.settings.SettingCodes.INITIAL_WINDOW_SIZE: 2000},
+        )
+        events = c.receive_data(f.serialize())
+        assert len(events) == 1
+        changes = events[0].changed_settings
+        assert list(changes) == [h2.settings.SettingCodes.INITIAL_WINDOW_SIZE]
+        change = changes[h2.settings.SettingCodes.INITIAL_WINDOW_SIZE]
+        assert change.original_value == 1000
+        assert change.new_value == 2000
+        assert c.remote_settings.initial_window_size == 2000
+        assert c.local_flow_control_window(1) == 2000
