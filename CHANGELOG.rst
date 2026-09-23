@@ -1,6 +1,18 @@
 Release History
 ===============
 
+4.4.2 (unreleased)
+------------------
+
+**Bugfixes**
+
+- Fixed the acknowledgement boundary of settings changes: a single SETTINGS
+  ACK now applies only the changes carried by the oldest unacknowledged
+  SETTINGS frame, instead of applying all outstanding changes at once.
+  Empty SETTINGS frames occupy their own acknowledgement slot, and the
+  ``SettingsAcknowledged`` event now describes only the changes applied by
+  the acknowledged frame.
+
 4.4.1 (2026-08-03)
 ------------------
 

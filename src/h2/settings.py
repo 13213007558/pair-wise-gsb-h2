@@ -102,9 +102,11 @@ class Settings(MutableMapping[SettingCodes | int, int]):
 
     This object encapsulates this mess. It provides a dict-like interface to
     settings, which return the *current* values of the settings in question.
-    Additionally, it keeps track of the stack of proposed values: each time an
-    acknowledgement is sent/received, it updates the current values with the
-    stack of proposed values. On top of all that, it validates the values to
+    Additionally, it keeps track of the queue of proposed values: each
+    SETTINGS frame that has been sent or received occupies exactly one slot
+    in the queue, and each acknowledgement consumes exactly one slot,
+    applying only the changes carried by that frame. On top of all that, it
+    validates the values to
     make sure they're allowed, and raises :class:`InvalidSettingsValueError
     <h2.exceptions.InvalidSettingsValueError>` if they are not.
 
@@ -116,6 +118,12 @@ class Settings(MutableMapping[SettingCodes | int, int]):
 
     .. versionchanged:: 2.5.0
        Added the ``max_header_list_size`` property.
+
+    .. versionchanged:: 4.4.2
+       Settings changes are now tracked per SETTINGS frame: a single
+       acknowledgement applies only the changes from the oldest
+       unacknowledged frame, instead of applying all outstanding changes at
+       once.
 
     :param client: (optional) Whether these settings should be defaulted for a
         client implementation or a server implementation. Defaults to ``True``.
@@ -129,18 +137,24 @@ class Settings(MutableMapping[SettingCodes | int, int]):
         self._client = client
 
         # Backing object for the settings. This is a dictionary of
-        # (setting: [list of values]), where the first value in the list is the
-        # current value of the setting. Strictly this doesn't use lists but
-        # instead uses collections.deque to avoid repeated memory allocations.
+        # (setting: value) holding the current values of the settings.
         #
         # This contains the default values for HTTP/2.
-        self._settings: dict[SettingCodes | int, collections.deque[int]] = {
-            SettingCodes.HEADER_TABLE_SIZE: collections.deque([4096]),
-            SettingCodes.ENABLE_PUSH: collections.deque([int(client)]),
-            SettingCodes.INITIAL_WINDOW_SIZE: collections.deque([65535]),
-            SettingCodes.MAX_FRAME_SIZE: collections.deque([16384]),
-            SettingCodes.ENABLE_CONNECT_PROTOCOL: collections.deque([0]),
+        self._settings: dict[SettingCodes | int, int] = {
+            SettingCodes.HEADER_TABLE_SIZE: 4096,
+            SettingCodes.ENABLE_PUSH: int(client),
+            SettingCodes.INITIAL_WINDOW_SIZE: 65535,
+            SettingCodes.MAX_FRAME_SIZE: 16384,
+            SettingCodes.ENABLE_CONNECT_PROTOCOL: 0,
         }
+
+        # A queue of unacknowledged SETTINGS frames. Each entry corresponds
+        # to exactly one SETTINGS frame that has been sent (or received) and
+        # not yet acknowledged, and maps the settings carried by that frame
+        # to their proposed new values. Each acknowledgement consumes
+        # exactly one entry, so changes take effect in the order the frames
+        # were sent. Empty SETTINGS frames occupy their own slot here.
+        self._pending_settings: collections.deque[dict[SettingCodes | int, int]] = collections.deque()
         if initial_values is not None:
             for key, value in initial_values.items():
                 invalid = _validate_setting(key, value)
@@ -150,26 +164,31 @@ class Settings(MutableMapping[SettingCodes | int, int]):
                         msg,
                         error_code=invalid,
                     )
-                self._settings[key] = collections.deque([value])
+                self._settings[key] = value
 
     def acknowledge(self) -> dict[SettingCodes | int, ChangedSetting]:
         """
         The settings have been acknowledged, either by the user (remote
         settings) or by the remote peer (local settings).
 
+        Exactly one unacknowledged SETTINGS frame is consumed: only the
+        changes carried by the oldest outstanding frame are applied. If no
+        SETTINGS frame is awaiting acknowledgement, nothing changes.
+
         :returns: A dict of {setting: ChangedSetting} that were applied.
         """
         changed_settings: dict[SettingCodes | int, ChangedSetting] = {}
 
-        # If there is more than one setting in the list, we have a setting
-        # value outstanding. Update them.
-        for k, v in self._settings.items():
-            if len(v) > 1:
-                old_setting = v.popleft()
-                new_setting = v[0]
-                changed_settings[k] = ChangedSetting(
-                    k, old_setting, new_setting,
-                )
+        if not self._pending_settings:
+            return changed_settings
+
+        pending_frame = self._pending_settings.popleft()
+        for setting, new_value in pending_frame.items():
+            original_value = self._settings.get(setting)
+            changed_settings[setting] = ChangedSetting(
+                setting, original_value, new_value,
+            )
+            self._settings[setting] = new_value
 
         return changed_settings
 
@@ -263,14 +282,7 @@ class Settings(MutableMapping[SettingCodes | int, int]):
 
     # Implement the MutableMapping API.
     def __getitem__(self, key: SettingCodes | int) -> int:
-        val = self._settings[key][0]
-
-        # Things that were created when a setting was received should stay
-        # KeyError'd.
-        if val is None:
-            raise KeyError
-
-        return val
+        return self._settings[key]
 
     def __setitem__(self, key: SettingCodes | int, value: int) -> None:
         invalid = _validate_setting(key, value)
@@ -281,13 +293,29 @@ class Settings(MutableMapping[SettingCodes | int, int]):
                 error_code=invalid,
             )
 
-        try:
-            items = self._settings[key]
-        except KeyError:
-            items = collections.deque([None])  # type: ignore
-            self._settings[key] = items
+        # Individual item sets are added to the most recent unacknowledged
+        # SETTINGS frame: if there is none, they start a new one.
+        if not self._pending_settings:
+            self._pending_settings.append({})
+        self._pending_settings[-1][key] = value
 
-        items.append(value)
+    def update(self, new_settings: dict[SettingCodes | int, int]) -> None:  # type: ignore[override]
+        """
+        Apply a batch of new settings values as a single unit, corresponding
+        to exactly one SETTINGS frame. The whole batch takes effect together
+        when that frame is acknowledged. Empty batches are allowed: an empty
+        SETTINGS frame still occupies its own acknowledgement slot.
+        """
+        for key, value in new_settings.items():
+            invalid = _validate_setting(key, value)
+            if invalid:
+                msg = f"Setting {key} has invalid value {value}"
+                raise InvalidSettingsValueError(
+                    msg,
+                    error_code=invalid,
+                )
+
+        self._pending_settings.append(dict(new_settings))
 
     def validate_received_setting(self, setting: SettingCodes | int, value: int) -> None:
         """
@@ -308,6 +336,8 @@ class Settings(MutableMapping[SettingCodes | int, int]):
 
     def __delitem__(self, key: SettingCodes | int) -> None:
         del self._settings[key]
+        for pending_frame in self._pending_settings:
+            pending_frame.pop(key, None)
 
     def __iter__(self) -> Iterator[SettingCodes | int]:
         return self._settings.__iter__()
@@ -317,7 +347,7 @@ class Settings(MutableMapping[SettingCodes | int, int]):
 
     def __eq__(self, other: object) -> bool:
         if isinstance(other, Settings):
-            return self._settings == other._settings
+            return self._settings == other._settings and self._pending_settings == other._pending_settings
         return NotImplemented
 
     def __ne__(self, other: object) -> bool:
