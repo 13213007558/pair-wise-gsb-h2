@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import pytest
 
+import h2.altsvc
 import h2.config
 import h2.connection
 import h2.events
@@ -469,3 +470,278 @@ class TestRFC7838Server:
                 field_value='h2=":8000"; ma=60',
                 origin=b"example.com",
             )
+class TestAltSvcFieldValueParsing:
+    """
+    Tests for the structured, parse-only view of the ALTSVC field value
+    exposed via AlternativeServiceAvailable.parsed and h2.altsvc.
+    """
+
+    example_request_headers = [
+        (":authority", "example.com"),
+        (":path", "/"),
+        (":scheme", "https"),
+        (":method", "GET"),
+    ]
+
+    def test_stream_zero_event_exposes_parsed_view(self, frame_factory) -> None:
+        """
+        A connection-level ALTSVC frame produces an event whose parsed view
+        matches the raw field value, which is preserved unmodified.
+        """
+        c = h2.connection.H2Connection()
+        c.initiate_connection()
+        c.clear_outbound_data_buffer()
+
+        f = frame_factory.build_alt_svc_frame(
+            stream_id=0,
+            origin=b"example.com",
+            field=b'h2=":8000"; ma=60; persist=1',
+        )
+        (event,) = c.receive_data(f.serialize())
+
+        assert isinstance(event, h2.events.AlternativeServiceAvailable)
+        assert event.origin == b"example.com"
+        assert event.field_value == b'h2=":8000"; ma=60; persist=1'
+
+        parsed = event.parsed
+        assert not parsed.clear
+        assert parsed.errors == ()
+        assert len(parsed.alternatives) == 1
+
+        alternative = parsed.alternatives[0]
+        assert alternative.protocol == "h2"
+        # An empty host means "the origin's host": it must not be turned
+        # into localhost or any other concrete name.
+        assert alternative.host is None
+        assert alternative.port == 8000
+        assert alternative.max_age == 60
+        assert alternative.persist is True
+
+    def test_stream_event_exposes_parsed_view(self, frame_factory) -> None:
+        """
+        A stream-level ALTSVC frame gets its origin from the stream's
+        :authority and still exposes the structured view.
+        """
+        c = h2.connection.H2Connection()
+        c.initiate_connection()
+        c.send_headers(stream_id=1, headers=self.example_request_headers)
+        c.clear_outbound_data_buffer()
+
+        f = frame_factory.build_alt_svc_frame(
+            stream_id=1, origin=b"", field=b'h3="alt.example.com:443"; ma=3600',
+        )
+        (event,) = c.receive_data(f.serialize())
+
+        assert event.origin == b"example.com"
+        assert event.field_value == b'h3="alt.example.com:443"; ma=3600'
+
+        parsed = event.parsed
+        assert parsed.errors == ()
+        (alternative,) = parsed.alternatives
+        assert alternative.protocol == "h3"
+        assert alternative.host == "alt.example.com"
+        assert alternative.port == 443
+        assert alternative.max_age == 3600
+        assert alternative.persist is None
+
+    def test_clear_field_value(self) -> None:
+        """
+        The field value "clear" empties the alternative list for the origin.
+        """
+        parsed = h2.altsvc.parse_alt_svc_field_value(b"clear")
+
+        assert parsed.clear
+        assert parsed.alternatives == ()
+        assert parsed.errors == ()
+
+    def test_clear_is_case_sensitive(self) -> None:
+        """
+        RFC 7838 defines "clear" as case-sensitive: "CLEAR" is not clear and
+        fails to parse as an alternative.
+        """
+        parsed = h2.altsvc.parse_alt_svc_field_value(b"CLEAR")
+
+        assert not parsed.clear
+        assert parsed.alternatives == ()
+        assert len(parsed.errors) == 1
+
+    def test_clear_cannot_be_combined_with_alternatives(self) -> None:
+        """
+        "clear" must be the entire field value: combining it with
+        alternatives is a grammar error.
+        """
+        parsed = h2.altsvc.parse_alt_svc_field_value(b'clear, h2=":443"')
+
+        assert not parsed.clear
+        assert len(parsed.alternatives) == 1
+        assert any("missing '='" in e.message for e in parsed.errors)
+
+    def test_ipv6_alt_authority(self) -> None:
+        """
+        IPv6 literals in brackets are recognised as hosts.
+        """
+        parsed = h2.altsvc.parse_alt_svc_field_value(b'h2="[2001:db8::1]:8443"')
+
+        assert parsed.errors == ()
+        (alternative,) = parsed.alternatives
+        assert alternative.host == "2001:db8::1"
+        assert alternative.port == 8443
+
+    def test_unterminated_ipv6_literal(self) -> None:
+        """
+        A missing closing bracket on an IP literal is a specific diagnostic.
+        """
+        parsed = h2.altsvc.parse_alt_svc_field_value(b'h2="[::1:443"')
+
+        assert parsed.alternatives == ()
+        assert any("IP literal" in e.message for e in parsed.errors)
+
+    def test_percent_encoded_protocol_id(self) -> None:
+        """
+        Percent-encoding in the protocol-id is decoded.
+        """
+        parsed = h2.altsvc.parse_alt_svc_field_value(b'h3%2D1=":443"')
+
+        assert parsed.errors == ()
+        (alternative,) = parsed.alternatives
+        assert alternative.protocol == "h3-1"
+
+    def test_invalid_percent_encoding_in_protocol_id(self) -> None:
+        """
+        Bad percent-encoding in the protocol-id is a specific diagnostic and
+        drops that alternative.
+        """
+        parsed = h2.altsvc.parse_alt_svc_field_value(b'h2%zz=":443"')
+
+        assert parsed.alternatives == ()
+        assert any("percent-encoding" in e.message for e in parsed.errors)
+
+    def test_unknown_parameters_are_preserved(self) -> None:
+        """
+        Unknown extension parameters are kept verbatim alongside the known
+        ones.
+        """
+        parsed = h2.altsvc.parse_alt_svc_field_value(
+            b'h2=":443"; ma=60; x-unknown="some value"; other=token',
+        )
+
+        assert parsed.errors == ()
+        (alternative,) = parsed.alternatives
+        assert alternative.parameters == {
+            "ma": "60",
+            "x-unknown": "some value",
+            "other": "token",
+        }
+        assert alternative.max_age == 60
+
+    def test_comma_inside_quoted_string_does_not_split(self) -> None:
+        """
+        Commas inside quoted-strings must not split the alternative list.
+        """
+        parsed = h2.altsvc.parse_alt_svc_field_value(
+            b'h2="a.example:443"; note="x,y", h3="b.example:8443"',
+        )
+
+        assert parsed.errors == ()
+        assert len(parsed.alternatives) == 2
+        assert parsed.alternatives[0].parameters["note"] == "x,y"
+        assert parsed.alternatives[1].protocol == "h3"
+
+    def test_quoted_string_escapes(self) -> None:
+        """
+        Quoted-pair escapes inside quoted-strings are resolved.
+        """
+        parsed = h2.altsvc.parse_alt_svc_field_value(
+            b'h2=":443"; note="say \\"hi\\""',
+        )
+
+        assert parsed.errors == ()
+        (alternative,) = parsed.alternatives
+        assert alternative.parameters["note"] == 'say "hi"'
+
+    def test_unterminated_quoted_string(self) -> None:
+        """
+        An unterminated quoted-string is diagnosed, not silently split.
+        """
+        parsed = h2.altsvc.parse_alt_svc_field_value(b'h2=":443; ma=60')
+
+        assert parsed.alternatives == ()
+        assert any("unterminated quoted-string" in e.message
+                   for e in parsed.errors)
+
+    def test_duplicate_parameters_are_diagnosed(self) -> None:
+        """
+        A repeated parameter name is a diagnostic; the first value wins.
+        """
+        parsed = h2.altsvc.parse_alt_svc_field_value(
+            b'h2=":443"; ma=60; ma=30',
+        )
+
+        (alternative,) = parsed.alternatives
+        assert alternative.max_age == 60
+        assert any("duplicate parameter" in e.message
+                   for e in parsed.errors)
+
+    @pytest.mark.parametrize("field_value", [
+        b'h2=":abc"',         # non-numeric port
+        b'h2=":"',            # empty port
+        b'h2=":70000"',       # out of range
+        b'h2="example.com"',  # missing port entirely
+    ])
+    def test_invalid_ports_are_diagnosed(self, field_value) -> None:
+        """
+        Bad ports produce specific diagnostics and drop the alternative.
+        """
+        parsed = h2.altsvc.parse_alt_svc_field_value(field_value)
+
+        assert parsed.alternatives == ()
+        assert len(parsed.errors) == 1
+
+    def test_partially_invalid_field_value(self) -> None:
+        """
+        A broken alternative does not discard the valid ones around it.
+        """
+        parsed = h2.altsvc.parse_alt_svc_field_value(
+            b'h2=":not-a-port", h3=":443", h2=":99999"',
+        )
+
+        assert len(parsed.alternatives) == 1
+        assert parsed.alternatives[0].protocol == "h3"
+        assert len(parsed.errors) == 2
+
+    def test_invalid_ma_and_persist_are_diagnosed(self) -> None:
+        """
+        Invalid values for the defined parameters are diagnosed but the
+        alternative itself survives.
+        """
+        parsed = h2.altsvc.parse_alt_svc_field_value(
+            b'h2=":443"; ma=soon; persist=2',
+        )
+
+        (alternative,) = parsed.alternatives
+        assert alternative.max_age is None
+        assert alternative.persist is False
+        assert any("ma" in e.message for e in parsed.errors)
+        assert any("persist" in e.message for e in parsed.errors)
+
+    def test_empty_alternative_in_list(self) -> None:
+        """
+        Empty list entries (consecutive commas) are diagnosed and skipped.
+        """
+        parsed = h2.altsvc.parse_alt_svc_field_value(
+            b'h2=":443", , h3=":80"',
+        )
+
+        assert len(parsed.alternatives) == 2
+        assert any("empty alternative" in e.message
+                   for e in parsed.errors)
+
+    def test_empty_field_value(self) -> None:
+        """
+        An empty field value is a diagnostic, not a crash.
+        """
+        parsed = h2.altsvc.parse_alt_svc_field_value(b"")
+
+        assert not parsed.clear
+        assert parsed.alternatives == ()
+        assert len(parsed.errors) == 1

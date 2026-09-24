@@ -14,6 +14,7 @@ import binascii
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from .altsvc import AltSvcFieldValue, parse_alt_svc_field_value
 from .settings import ChangedSetting, SettingCodes, Settings, _setting_code_from_int
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -606,8 +607,11 @@ class AlternativeServiceAvailable(Event):
 
     This event also carries what RFC 7838 calls the "Alternative Service Field
     Value", which is formatted like a HTTP header field and contains the
-    relevant alternative service information. h2 does not parse or in any
-    way modify that information: the user is required to do that.
+    relevant alternative service information. The raw field value is always
+    preserved unmodified in ``field_value``. A structured, parse-only view of
+    it (protocol, host, port, max-age, persist and extension parameters, plus
+    diagnostics for anything malformed) is available via the ``parsed``
+    property. Parsing never performs DNS resolution or opens connections.
 
     This event can only be fired on the client end of a connection.
 
@@ -628,6 +632,28 @@ class AlternativeServiceAvailable(Event):
         #: structure of the data in this field is given by `RFC 7838 Section 3
         #: <https://tools.ietf.org/html/rfc7838#section-3>`_.
         self.field_value: bytes | None = None
+
+        #: Lazily computed structured view of ``field_value``.
+        self._parsed: AltSvcFieldValue | None = None
+
+    @property
+    def parsed(self) -> AltSvcFieldValue:
+        """
+        The structured view of the ALTSVC field value, parsed according to
+        the RFC 7838 grammar.
+
+        Exposes the advertised alternatives (ALPN protocol id, target host
+        and port, ``ma``/``persist`` and any unknown extension parameters),
+        whether the field value was ``clear``, and diagnostics describing
+        anything that did not parse. The raw ``field_value`` is left
+        untouched. This is a pure parse: no DNS queries are made and no
+        connections are opened.
+
+        .. versionadded:: 4.5.0
+        """
+        if self._parsed is None:
+            self._parsed = parse_alt_svc_field_value(self.field_value)
+        return self._parsed
 
     def __repr__(self) -> str:
         return (

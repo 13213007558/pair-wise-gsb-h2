@@ -1,6 +1,18 @@
 Release History
 ===============
 
+4.5.0 (Unreleased)
+------------------
+
+**API Changes (Backward Compatible)**
+
+- Added a structured, parse-only view of the RFC 7838 ALTSVC field value.
+  ``AlternativeServiceAvailable`` now exposes a ``parsed`` property (backed
+  by the new ``h2.altsvc`` module) that reports the advertised alternatives
+  (protocol id, host, port, ``ma``/``persist`` and unknown extension
+  parameters), whether the field value was ``clear``, and diagnostics for
+  anything malformed. The raw ``field_value`` remains available unmodified.
+
 4.4.1 (2026-08-03)
 ------------------
 

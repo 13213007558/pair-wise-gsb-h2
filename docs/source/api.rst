@@ -83,6 +83,20 @@ Events
 .. autoclass:: h2.events.UnknownFrameReceived
    :members:
 
+Alternative Services
+--------------------
+
+.. autoclass:: h2.altsvc.AltSvcFieldValue
+   :members:
+
+.. autoclass:: h2.altsvc.AlternativeService
+   :members:
+
+.. autoclass:: h2.altsvc.AltSvcParseError
+   :members:
+
+.. autofunction:: h2.altsvc.parse_alt_svc_field_value
+
 
 Exceptions
 ----------
