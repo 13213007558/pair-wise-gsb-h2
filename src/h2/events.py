@@ -21,6 +21,7 @@ if TYPE_CHECKING:  # pragma: no cover
     from hyperframe.frame import Frame
 
     from .errors import ErrorCodes
+    from .origin import InvalidOrigin, Origin
 
 
 kw_only = {"kw_only": True}
@@ -636,6 +637,51 @@ class AlternativeServiceAvailable(Event):
                 (self.field_value or b"").decode("utf-8", "ignore"),
             )
         )
+
+
+@dataclass(**kw_only)
+class OriginReceived(Event):
+    """
+    The OriginReceived event is fired when the remote peer sends an
+    `RFC 8336 <https://tools.ietf.org/html/rfc8336>`_ ORIGIN frame,
+    declaring origins for which the peer claims it could provide
+    authoritative responses on this connection.
+
+    The event carries the valid, normalized origins from the frame, along
+    with diagnostic information about any Origin-Entry fields that did not
+    contain a valid origin (which RFC 8336 requires to be ignored).
+
+    The origins declared across all ORIGIN frames received so far are also
+    accumulated into the connection's Origin Set, available as
+    :attr:`H2Connection.origin_set <h2.connection.H2Connection.origin_set>`.
+
+    .. warning::
+
+       Receiving an ORIGIN frame is *not* a substitute for authentication:
+       it does not mean the peer's certificate is valid for these origins,
+       nor that DNS resolution would agree. As required by RFC 8336, the
+       application must still validate the certificate (and any other
+       properties it cares about) for an origin before using this
+       connection for requests to it.
+
+    This event can only be fired on the client end of a connection.
+
+    .. versionadded:: 4.5.0
+    """
+
+    #: The valid origins declared by this frame, normalized per RFC 6454:
+    #: lowercase scheme and host, IDNA host names in A-label (punycode)
+    #: form, compressed IPv6 literals, and default ports removed.
+    origins: list[Origin]
+
+    #: The Origin-Entry fields that did not contain a valid origin. These
+    #: entries are ignored per RFC 8336, but are reported here (raw bytes
+    #: plus a reason) to help diagnose misbehaving peers.
+    invalid_origins: list[InvalidOrigin]
+
+    def __repr__(self) -> str:
+        origins = [str(origin) for origin in self.origins]
+        return f"<OriginReceived origins:{origins}, invalid_origins:{self.invalid_origins}>"
 
 
 @dataclass(**kw_only)

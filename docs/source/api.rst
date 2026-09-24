@@ -80,7 +80,24 @@ Events
 .. autoclass:: h2.events.AlternativeServiceAvailable
    :members:
 
+.. autoclass:: h2.events.OriginReceived
+   :members:
+
 .. autoclass:: h2.events.UnknownFrameReceived
+   :members:
+
+
+Origins
+-------
+
+.. autoclass:: h2.origin.Origin
+   :members:
+
+.. autoclass:: h2.origin.InvalidOrigin
+   :members:
+
+.. autoclass:: h2.origin.OriginParseError
+   :show-inheritance:
    :members:
 
 

@@ -36,6 +36,7 @@ from .events import (
     ConnectionTerminated,
     Event,
     InformationalResponseReceived,
+    OriginReceived,
     PingAckReceived,
     PingReceived,
     PriorityUpdated,
@@ -60,6 +61,7 @@ from .exceptions import (
     TooManyStreamsError,
 )
 from .frame_buffer import FrameBuffer
+from .origin import ORIGIN_FRAME_TYPE, Origin, normalize_origin, parse_origin_frame_body, serialize_origin
 from .settings import ChangedSetting, SettingCodes, Settings
 from .stream import H2Stream, StreamClosedBy
 from .utilities import SizeLimitDict, guard_increment_window
@@ -101,6 +103,8 @@ class ConnectionInputs(Enum):
     RECV_PRIORITY = 17
     SEND_ALTERNATIVE_SERVICE = 18  # Added in 2.3.0
     RECV_ALTERNATIVE_SERVICE = 19  # Added in 2.3.0
+    SEND_ORIGIN = 20  # Added in 4.5.0
+    RECV_ORIGIN = 21  # Added in 4.5.0
 
 
 class AllowedStreamIDs(IntEnum):
@@ -158,6 +162,10 @@ class H2ConnectionStateMachine:
             (None, ConnectionState.SERVER_OPEN),
         (ConnectionState.IDLE, ConnectionInputs.RECV_ALTERNATIVE_SERVICE):
             (None, ConnectionState.CLIENT_OPEN),
+        (ConnectionState.IDLE, ConnectionInputs.SEND_ORIGIN):
+            (None, ConnectionState.SERVER_OPEN),
+        (ConnectionState.IDLE, ConnectionInputs.RECV_ORIGIN):
+            (None, ConnectionState.CLIENT_OPEN),
 
         # State: open, client side.
         (ConnectionState.CLIENT_OPEN, ConnectionInputs.SEND_HEADERS):
@@ -197,6 +205,8 @@ class H2ConnectionStateMachine:
         (ConnectionState.CLIENT_OPEN,
             ConnectionInputs.RECV_ALTERNATIVE_SERVICE):
                 (None, ConnectionState.CLIENT_OPEN),
+        (ConnectionState.CLIENT_OPEN, ConnectionInputs.RECV_ORIGIN):
+            (None, ConnectionState.CLIENT_OPEN),
 
         # State: open, server side.
         (ConnectionState.SERVER_OPEN, ConnectionInputs.SEND_HEADERS):
@@ -239,6 +249,8 @@ class H2ConnectionStateMachine:
         (ConnectionState.SERVER_OPEN,
             ConnectionInputs.RECV_ALTERNATIVE_SERVICE):
                 (None, ConnectionState.SERVER_OPEN),
+        (ConnectionState.SERVER_OPEN, ConnectionInputs.SEND_ORIGIN):
+            (None, ConnectionState.SERVER_OPEN),
 
         # State: closed
         (ConnectionState.CLOSED, ConnectionInputs.SEND_GOAWAY):
@@ -401,6 +413,11 @@ class H2Connection:
             max_window_size=self.local_settings.initial_window_size,
         )
 
+        # The RFC 8336 Origin Set: the origins the peer has declared on
+        # this connection via ORIGIN frames. Only populated on clients,
+        # since servers must not receive ORIGIN frames.
+        self._origin_set: dict[Origin, None] = {}
+
         # When in doubt use dict-dispatch.
         self._frame_dispatch_table: dict[type[Frame], Callable] = {  # type: ignore
             HeadersFrame: self._receive_headers_frame,
@@ -459,6 +476,28 @@ class H2Connection:
         """
         inbound_numbers = int(not self.config.client_side)
         return self._open_streams(inbound_numbers)
+
+    @property
+    def origin_set(self) -> tuple[Origin, ...]:
+        """
+        The current RFC 8336 Origin Set for this connection: the origins
+        the remote peer has declared via ORIGIN frames so far, in the
+        order they were first declared.
+
+        The set starts empty. Each successfully processed ORIGIN frame
+        adds its origins to the set; duplicate declarations are collapsed.
+
+        .. warning::
+
+           Membership in this set only reflects what the peer has
+           *claimed*. It does not mean the peer's certificate has been
+           validated for these origins, nor that DNS agrees: those checks
+           remain the responsibility of the application, as required by
+           RFC 8336.
+
+        .. versionadded:: 4.5.0
+        """
+        return tuple(self._origin_set)
 
     @property
     def inbound_flow_control_window(self) -> int:
@@ -1207,6 +1246,65 @@ class H2Connection:
             frames = stream.advertise_alternative_service(field_value)
 
         self._prepare_for_sending(frames)
+
+    def send_origin(self, origins: Iterable[Origin | str]) -> None:
+        """
+        Send an ORIGIN frame, as defined in RFC 8336, declaring origins
+        for which this peer is authoritative on this connection.
+
+        Only servers may send ORIGIN frames: calling this on a client
+        connection raises ``ProtocolError``. The frame is sent on stream 0.
+
+        Each origin may be given either as an :class:`Origin
+        <h2.origin.Origin>` or as a string (e.g. ``"https://example.com"``),
+        which is parsed and normalized: internationalized domain names may
+        be given as U-labels and are sent in their A-label (punycode) form.
+        Invalid origins raise :class:`OriginParseError
+        <h2.origin.OriginParseError>`.
+
+        If the resulting frame would exceed the peer's maximum frame size,
+        the origins are spread across as many ORIGIN frames as needed.
+
+        .. versionadded:: 4.5.0
+
+        :param origins: The origins to declare.
+        :type origins: iterable of ``h2.origin.Origin`` or ``str``
+
+        :returns: Nothing.
+        """
+        if self.config.client_side:
+            msg = "Clients must not send ORIGIN frames."
+            raise ProtocolError(msg)
+
+        entries = [
+            serialize_origin(origin if isinstance(origin, Origin) else normalize_origin(origin))
+            for origin in origins
+        ]
+
+        self.state_machine.process_input(ConnectionInputs.SEND_ORIGIN)
+
+        frames: list[Frame] = []
+        body = bytearray()
+        for entry in entries:
+            if len(entry) > self.max_outbound_frame_size:
+                msg = "Single origin entry exceeds the maximum frame size."
+                raise ValueError(msg)
+            if body and len(body) + len(entry) > self.max_outbound_frame_size:
+                frames.append(self._build_origin_frame(bytes(body)))
+                body = bytearray()
+            body += entry
+        frames.append(self._build_origin_frame(bytes(body)))
+
+        self._prepare_for_sending(frames)
+
+    @staticmethod
+    def _build_origin_frame(body: bytes) -> ExtensionFrame:
+        """
+        Build an ORIGIN frame (an extension frame of type 0xC) on stream 0.
+        """
+        frame = ExtensionFrame(type=ORIGIN_FRAME_TYPE, stream_id=0, body=body)
+        frame.body_len = len(body)
+        return frame
 
     def prioritize(self,
                    stream_id: int,
@@ -1976,12 +2074,49 @@ class H2Connection:
         RFC 7540 § 5.5 says that we MUST ignore unknown frame types: so we
         do. We do notify the user that we received one, however.
         """
+        if frame.type == ORIGIN_FRAME_TYPE:
+            return self._receive_origin_frame(frame)
+
         # All we do here is log.
         self.config.logger.debug(
             "Received unknown extension frame (ID %d)", frame.stream_id,
         )
         event = UnknownFrameReceived(frame=frame)
         return [], [event]
+
+    def _receive_origin_frame(self, frame: ExtensionFrame) -> tuple[list[Frame], list[Event]]:
+        """
+        An ORIGIN frame has been received. This frame, specified in
+        RFC 8336, allows a server to declare the origins for which it is
+        authoritative on this connection.
+
+        The frame is only valid on stream 0, and only servers may send it:
+        violations of either rule are connection errors of type
+        PROTOCOL_ERROR. A structurally malformed payload is also a
+        connection error, and is detected before any state is updated so
+        that the Origin Set is never partially modified.
+        """
+        if frame.stream_id != 0:
+            msg = f"ORIGIN frame received on stream {frame.stream_id}: must be sent on stream 0."
+            raise ProtocolError(msg)
+
+        if not self.config.client_side:
+            msg = "Servers must not receive ORIGIN frames."
+            raise ProtocolError(msg)
+
+        events = self.state_machine.process_input(
+            ConnectionInputs.RECV_ORIGIN,
+        )
+
+        # Parse the entire payload before touching the Origin Set: if the
+        # frame is malformed this raises, leaving the set untouched.
+        origins, invalid_origins = parse_origin_frame_body(frame.body)
+        for origin in origins:
+            self._origin_set.setdefault(origin)
+
+        event = OriginReceived(origins=origins, invalid_origins=invalid_origins)
+        events.append(event)
+        return [], events
 
     def _local_settings_acked(self) -> dict[SettingCodes | int, ChangedSetting]:
         """

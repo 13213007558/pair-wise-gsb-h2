@@ -1,6 +1,20 @@
 Release History
 ===============
 
+4.5.0 (unreleased)
+------------------
+
+**API Changes (Backward Compatible)**
+
+- Added support for the RFC 8336 ORIGIN frame. Servers can declare the
+  origins they are authoritative for with the new
+  ``H2Connection.send_origin`` method. Clients receive the new
+  ``OriginReceived`` event and can read the connection's accumulated Origin
+  Set via the new ``H2Connection.origin_set`` property. Origins are
+  normalized (lowercased, IDNA A-labels, compressed IPv6, default ports
+  removed); invalid Origin-Entry fields are ignored as required by the RFC
+  and reported on the event for diagnostics.
+
 4.4.1 (2026-08-03)
 ------------------
 
