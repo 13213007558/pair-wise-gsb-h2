@@ -14,6 +14,7 @@ import binascii
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from .alternative_services import AlternativeService, ParsedAlternativeServices, parse_alternative_services
 from .settings import ChangedSetting, SettingCodes, Settings, _setting_code_from_int
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -605,9 +606,8 @@ class AlternativeServiceAvailable(Event):
     the user when initiating a given stream.
 
     This event also carries what RFC 7838 calls the "Alternative Service Field
-    Value", which is formatted like a HTTP header field and contains the
-    relevant alternative service information. h2 does not parse or in any
-    way modify that information: the user is required to do that.
+    Value", along with a structured, locally parsed view of that value.
+    Parsing does not perform DNS resolution or establish a connection.
 
     This event can only be fired on the client end of a connection.
 
@@ -622,12 +622,34 @@ class AlternativeServiceAvailable(Event):
         #: received.
         self.origin: bytes | None = None
 
-        #: The ALTSVC field value. This contains information about the HTTP
-        #: alternative service being advertised by the server. h2 does
-        #: not parse this field: it is left exactly as sent by the server. The
-        #: structure of the data in this field is given by `RFC 7838 Section 3
-        #: <https://tools.ietf.org/html/rfc7838#section-3>`_.
+        #: The ALTSVC field value, left exactly as sent by the server. The
+        #: structured view is given by :attr:`alternatives`, :attr:`clear`,
+        #: and :attr:`errors`.
         self.field_value: bytes | None = None
+
+        #: Parsed alternative service candidates. Empty advertised hosts
+        #: inherit :attr:`origin` rather than becoming ``localhost``.
+        self.alternatives: list[AlternativeService] = []
+
+        #: Alias for :attr:`alternatives`.
+        self.alternative_services = self.alternatives
+
+        #: Whether the field value was the RFC 7838 ``clear`` directive.
+        self.clear: bool = False
+
+        #: Field-level syntax diagnostics. Candidate-specific diagnostics are
+        #: attached to each entry in :attr:`alternatives`.
+        self.errors: list[str] = []
+
+    def _populate(self, origin: bytes | None, field_value: bytes) -> None:
+        """Populate the raw and structured representation of an ALTSVC event."""
+        parsed: ParsedAlternativeServices = parse_alternative_services(field_value, origin)
+        self.origin = origin
+        self.field_value = field_value
+        self.alternatives = parsed.alternatives
+        self.alternative_services = parsed.alternatives
+        self.clear = parsed.clear
+        self.errors = parsed.errors
 
     def __repr__(self) -> str:
         return (

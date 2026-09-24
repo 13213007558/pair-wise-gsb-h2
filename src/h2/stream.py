@@ -1202,8 +1202,7 @@ class H2Stream:
         # fill it out.
         if events:
             assert isinstance(events[0], AlternativeServiceAvailable)
-            events[0].origin = self._authority
-            events[0].field_value = frame.field
+            events[0]._populate(self._authority, frame.field)
 
         return [], events
 

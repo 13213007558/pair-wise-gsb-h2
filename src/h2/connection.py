@@ -1961,8 +1961,7 @@ class H2Connection:
                 return frames, events
 
             event = AlternativeServiceAvailable()
-            event.origin = frame.origin
-            event.field_value = frame.field
+            event._populate(frame.origin, frame.field)
             events.append(event)
 
         return frames, events

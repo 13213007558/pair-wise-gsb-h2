@@ -53,6 +53,9 @@ class TestRFC7838Client:
         assert isinstance(event, h2.events.AlternativeServiceAvailable)
         assert event.origin == b"example.com"
         assert event.field_value == b'h2=":8000"; ma=60'
+        assert event.alternatives[0].host == b"example.com"
+        assert event.alternatives[0].port == 8000
+        assert event.alternatives[0].max_age == 60
 
         # No data gets sent.
         assert not c.data_to_send()
@@ -73,6 +76,29 @@ class TestRFC7838Client:
 
         assert not events
         assert not c.data_to_send()
+
+    def test_receiving_clear_altsvc_stream_zero(self, frame_factory) -> None:
+        """
+        A clear ALTSVC field retains its raw value and structured directive.
+        """
+        c = h2.connection.H2Connection()
+        c.initiate_connection()
+        c.clear_outbound_data_buffer()
+
+        f = frame_factory.build_alt_svc_frame(
+            stream_id=0, origin=b"https://example.com", field=b"clear",
+        )
+        events = c.receive_data(f.serialize())
+
+        assert len(events) == 1
+        event = events[0]
+
+        assert isinstance(event, h2.events.AlternativeServiceAvailable)
+        assert event.origin == b"https://example.com"
+        assert event.field_value == b"clear"
+        assert event.clear is True
+        assert event.alternatives == []
+        assert event.errors == []
 
     @pytest.mark.parametrize("request_headers", [example_request_headers, example_request_headers_bytes])
     def test_receiving_altsvc_on_stream(self, frame_factory, request_headers) -> None:
@@ -96,6 +122,9 @@ class TestRFC7838Client:
         assert isinstance(event, h2.events.AlternativeServiceAvailable)
         assert event.origin == b"example.com"
         assert event.field_value == b'h2=":8000"; ma=60'
+        assert event.alternatives[0].host == b"example.com"
+        assert event.alternatives[0].port == 8000
+        assert event.alternatives[0].max_age == 60
 
         # No data gets sent.
         assert not c.data_to_send()
