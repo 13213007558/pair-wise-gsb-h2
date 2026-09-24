@@ -1,6 +1,20 @@
 Release History
 ===============
 
+4.5.0 (unreleased)
+------------------
+
+**API Changes (Backward Compatible)**
+
+- Added support for the RFC 8336 ORIGIN frame. Servers can advertise the
+  origins for which a connection is authoritative with the new
+  ``H2Connection.send_origin`` method. Clients are notified of received
+  ORIGIN frames via the new ``OriginReceived`` event, and can inspect the
+  set of origins advertised on the connection via the new
+  ``H2Connection.origin_set`` property. Validating those origins against
+  the TLS certificate and coalescing connections remains the
+  responsibility of the application.
+
 4.4.1 (2026-08-03)
 ------------------
 

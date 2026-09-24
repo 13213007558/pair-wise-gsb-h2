@@ -8,6 +8,7 @@ from hyperframe.frame import (
     AltSvcFrame,
     ContinuationFrame,
     DataFrame,
+    ExtensionFrame,
     GoAwayFrame,
     HeadersFrame,
     PingFrame,
@@ -178,6 +179,18 @@ class FrameFactory:
         f = AltSvcFrame(stream_id)
         f.origin = origin
         f.field = field
+        return f
+
+    def build_origin_frame(self, origins, stream_id=0):
+        """
+        Builds a single RFC 8336 ORIGIN frame.
+        """
+        body = b"".join(
+            len(origin).to_bytes(2, "big") + origin for origin in origins
+        )
+        f = ExtensionFrame(0xC, stream_id)
+        f.body = body
+        f.body_len = len(body)
         return f
 
     def change_table_size(self, new_size) -> None:
