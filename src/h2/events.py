@@ -639,6 +639,38 @@ class AlternativeServiceAvailable(Event):
 
 
 @dataclass(**kw_only)
+class OriginReceived(Event):
+    """
+    The OriginReceived event is fired when the remote peer sends an ORIGIN
+    frame, as defined in `RFC 8336 <https://tools.ietf.org/html/rfc8336>`_.
+
+    This event carries the origins that were present in the frame. h2 does
+    not validate these origins against the TLS certificate presented by the
+    server, nor does it perform any connection coalescing: deciding whether
+    this connection may be used for the advertised origins is left to the
+    user.
+
+    The set of origins currently advertised on the connection (the "Origin
+    Set" in RFC 8336 terms) is available on the connection itself: see
+    :attr:`h2.connection.H2Connection.origin_set`.
+
+    This event can only be fired on the client end of a connection.
+
+    .. versionadded:: 4.5.0
+    """
+
+    #: The origins contained in this ORIGIN frame, in the order they
+    #: appeared on the wire. Origins that are not valid ASCII serializations
+    #: of an origin (RFC 6454 section 6.2) have been removed, but duplicates
+    #: are preserved exactly as sent by the server.
+    origins: list[bytes]
+
+    def __repr__(self) -> str:
+        origins = [origin.decode("utf-8", "ignore") for origin in self.origins]
+        return f"<OriginReceived origins:{origins}>"
+
+
+@dataclass(**kw_only)
 class UnknownFrameReceived(Event):
     """
     The UnknownFrameReceived event is fired when the remote peer sends a frame

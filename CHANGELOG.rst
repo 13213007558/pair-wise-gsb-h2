@@ -1,6 +1,20 @@
 Release History
 ===============
 
+4.5.0 (unreleased)
+------------------
+
+**API Changes (Backward Compatible)**
+
+- Added support for the ORIGIN frame, defined in RFC 8336. Servers can
+  advertise the origins a connection is authoritative for with the new
+  ``H2Connection.send_origin`` method. Clients are notified of received
+  ORIGIN frames via the new ``OriginReceived`` event, and can inspect the
+  Origin Set currently advertised on the connection via the new
+  ``H2Connection.origin_set`` property. Validating these origins against
+  the peer's certificate and deciding whether to reuse the connection for
+  them remains the responsibility of the user.
+
 4.4.1 (2026-08-03)
 ------------------
 

@@ -7,6 +7,7 @@ Utility functions that do not belong in a separate module.
 from __future__ import annotations
 
 import collections
+import re
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 from hpack.struct import HeaderTuple, NeverIndexedHeaderTuple
@@ -522,6 +523,33 @@ def _check_path_header(headers: Iterable[Header],
     return inner()
 
 
+# Matches the ASCII serialization of an origin, as defined by RFC 6454
+# section 6.2: scheme "://" host [ ":" port ]. The host may be a reg-name,
+# an IPv4 address, or a bracketed IP literal (e.g. IPv6). The match is
+# deliberately structural only: the scheme, host, and port are preserved
+# exactly as given, including any explicit port and IPv6 brackets.
+_ORIGIN_RE = re.compile(
+    rb"\A"
+    rb"[A-Za-z][A-Za-z0-9+.-]*"  # scheme
+    rb"://"
+    rb"(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9._~-]+)"  # host
+    rb"(?::[0-9]+)?"  # optional port
+    rb"\Z",
+)
+
+
+def is_valid_origin(origin: bytes) -> bool:
+    """
+    Confirm that a bytestring is a plausible ASCII serialization of an
+    origin, as defined by RFC 6454 section 6.2 and used by the ORIGIN frame
+    (RFC 8336).
+
+    This is a purely syntactic check: it does not tell the caller anything
+    about whether the origin is trustworthy for a given connection.
+    """
+    return _ORIGIN_RE.match(origin) is not None
+
+
 def _to_bytes(v: bytes | str) -> bytes:
     """
     Given an assumed `str` (or anything that supports `.encode()`),
@@ -723,4 +751,3 @@ class SizeLimitDict(collections.OrderedDict[int, Any]):
         if self._size_limit is not None:
             while len(self) > self._size_limit:
                 self.popitem(last=False)
-
