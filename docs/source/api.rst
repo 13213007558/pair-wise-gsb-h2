@@ -47,6 +47,9 @@ Events
 .. autoclass:: h2.events.DataReceived
    :members:
 
+.. autoclass:: h2.events.DataAcknowledgment
+   :members:
+
 .. autoclass:: h2.events.WindowUpdated
    :members:
 

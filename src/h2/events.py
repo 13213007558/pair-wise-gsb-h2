@@ -14,6 +14,9 @@ import binascii
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+# Re-exported so that the token carried by DataReceived events can be
+# imported from the same module as the event itself.
+from .acknowledgment import DataAcknowledgment  # noqa: TC001
 from .settings import ChangedSetting, SettingCodes, Settings, _setting_code_from_int
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -306,6 +309,19 @@ class DataReceived(Event):
     here.
 
     .. versionadded:: 2.4.0
+    """
+
+    data_acknowledgment: DataAcknowledgment | None = None
+    """
+    A single-use token that hands the flow-controlled bytes of this DATA
+    frame back to the remote peer as the application consumes them. This
+    is only present when the connection was configured with
+    ``data_acknowledgment_tokens`` set to ``True``: otherwise it is
+    ``None`` and the application must call
+    :meth:`acknowledge_received_data
+    <h2.connection.H2Connection.acknowledge_received_data>` itself.
+
+    .. versionadded:: 4.5.0
     """
 
     def __repr__(self) -> str:

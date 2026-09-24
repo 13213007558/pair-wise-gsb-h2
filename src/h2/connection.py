@@ -29,11 +29,13 @@ from hyperframe.frame import (
     WindowUpdateFrame,
 )
 
+from .acknowledgment import DataAcknowledgment
 from .config import H2Configuration
 from .errors import ErrorCodes, _error_code_from_int
 from .events import (
     AlternativeServiceAvailable,
     ConnectionTerminated,
+    DataReceived,
     Event,
     InformationalResponseReceived,
     PingAckReceived,
@@ -1364,6 +1366,13 @@ class H2Connection:
             "Ack received data on stream ID %d with size %d",
             stream_id, acknowledged_size,
         )
+        if self.config.data_acknowledgment_tokens:
+            msg = (
+                "acknowledge_received_data cannot be used when "
+                "data_acknowledgment_tokens is enabled: acknowledge the "
+                "DataAcknowledgment token on the DataReceived event instead"
+            )
+            raise RuntimeError(msg)
         if stream_id <= 0:
             msg = f"Stream ID {stream_id} is not valid for acknowledge_received_data"
             raise ValueError(msg)
@@ -1371,6 +1380,93 @@ class H2Connection:
             msg = "Cannot acknowledge negative data"
             raise ValueError(msg)
 
+        self._return_received_data(acknowledged_size, stream_id)
+
+    def acknowledge_data_token(self,
+                               token: DataAcknowledgment,
+                               amount: int | None = None) -> None:
+        """
+        Inform the :class:`H2Connection <h2.connection.H2Connection>` that
+        some of the payload bytes tracked by a :class:`DataAcknowledgment
+        <h2.events.DataAcknowledgment>` token have been processed, and that
+        the space should be handed back to the remote peer at an opportune
+        time.
+
+        ``amount`` counts *payload* bytes only: when the final payload byte
+        is acknowledged, any padding that was sent with the data is handed
+        back automatically and the token becomes exhausted. If ``amount``
+        is not given, all remaining payload bytes are acknowledged.
+
+        Each token can return its total flow-controlled length exactly
+        once: acknowledging an exhausted token, acknowledging more than
+        the remaining payload, or using a token that belongs to a
+        different connection are all rejected before any flow control
+        window is changed.
+
+        .. versionadded:: 4.5.0
+
+        :param token: The token carried by the :class:`DataReceived
+            <h2.events.DataReceived>` event for the data being
+            acknowledged.
+        :type token: :class:`DataAcknowledgment <h2.events.DataAcknowledgment>`
+        :param amount: The number of *payload* bytes that have been
+            processed, or ``None`` to acknowledge all remaining payload
+            bytes.
+        :type amount: ``int`` or ``None``
+        :returns: Nothing
+        :rtype: ``None``
+        """
+        if not self.config.data_acknowledgment_tokens:
+            msg = (
+                "acknowledge_data_token requires data_acknowledgment_tokens "
+                "to be enabled in the H2Configuration"
+            )
+            raise RuntimeError(msg)
+        if not isinstance(token, DataAcknowledgment):
+            msg = f"Expected a DataAcknowledgment token, got {token!r}"
+            raise TypeError(msg)
+        if token._connection is not self:
+            msg = "Cannot acknowledge data using a token from a different connection"
+            raise ValueError(msg)
+        if token.exhausted:
+            msg = "This data has already been fully acknowledged"
+            raise ValueError(msg)
+
+        if amount is None:
+            amount = token.remaining
+        if amount < 0:
+            msg = "Cannot acknowledge negative data"
+            raise ValueError(msg)
+        if amount > token.remaining:
+            msg = (
+                f"Cannot acknowledge {amount} bytes: only {token.remaining} "
+                "payload bytes remain on this token"
+            )
+            raise ValueError(msg)
+
+        self.config.logger.debug(
+            "Ack received data on stream ID %d with size %d via token",
+            token.stream_id, amount,
+        )
+
+        token._acknowledged += amount
+        flow_controlled_amount = amount
+        if token.remaining == 0:
+            # All payload bytes have been consumed: hand back the padding
+            # as well and retire the token.
+            flow_controlled_amount += (
+                token.flow_controlled_length - token.data_length
+            )
+            token._exhausted = True
+
+        self._return_received_data(flow_controlled_amount, token.stream_id)
+
+    def _return_received_data(self, acknowledged_size: int, stream_id: int) -> None:
+        """
+        Hand ``acknowledged_size`` flow-controlled bytes back to the remote
+        peer, emitting WINDOW_UPDATE frames for the connection and, if it
+        is still open, the stream the data was received on.
+        """
         frames: list[Frame] = []
 
         conn_manager = self._inbound_flow_control_window_manager
@@ -1757,6 +1853,16 @@ class H2Connection:
             # This stream is either marked as CLOSED or already gone from our
             # internal state.
             return self._handle_data_on_closed_stream(events, e, frame)
+
+        if self.config.data_acknowledgment_tokens:
+            data_event = stream_events[0]
+            assert isinstance(data_event, DataReceived)
+            data_event.data_acknowledgment = DataAcknowledgment(
+                connection=self,
+                stream_id=frame.stream_id,
+                data_length=len(frame.data),
+                flow_controlled_length=flow_controlled_length,
+            )
 
         return frames, events + stream_events
 

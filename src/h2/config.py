@@ -149,6 +149,21 @@ class H2Configuration:
         .. versionadded:: 2.6.0
 
     :type logger: ``logging.Logger``
+
+    :param data_acknowledgment_tokens: Controls whether each
+        :class:`DataReceived <h2.events.DataReceived>` event carries a
+        single-use :class:`DataAcknowledgment
+        <h2.events.DataAcknowledgment>` token that the application uses to
+        hand flow-controlled bytes back to the remote peer, instead of
+        calling :meth:`acknowledge_received_data
+        <h2.connection.H2Connection.acknowledge_received_data>` manually.
+        When enabled, calling ``acknowledge_received_data`` on the
+        connection raises an error, to prevent the same data from being
+        acknowledged twice. Defaults to ``False``.
+
+        .. versionadded:: 4.5.0
+
+    :type data_acknowledgment_tokens: ``bool``
     """
 
     client_side = _BooleanConfigOption("client_side")
@@ -167,6 +182,9 @@ class H2Configuration:
     normalize_inbound_headers = _BooleanConfigOption(
         "normalize_inbound_headers",
     )
+    data_acknowledgment_tokens = _BooleanConfigOption(
+        "data_acknowledgment_tokens",
+    )
 
     def __init__(self,
                  client_side: bool = True,
@@ -176,6 +194,7 @@ class H2Configuration:
                  split_outbound_cookies: bool = False,
                  validate_inbound_headers: bool = True,
                  normalize_inbound_headers: bool = True,
+                 data_acknowledgment_tokens: bool = False,
                  logger: DummyLogger | OutputLogger | None = None) -> None:
         self.client_side = client_side
         self.header_encoding = header_encoding
@@ -184,6 +203,7 @@ class H2Configuration:
         self.split_outbound_cookies = split_outbound_cookies
         self.validate_inbound_headers = validate_inbound_headers
         self.normalize_inbound_headers = normalize_inbound_headers
+        self.data_acknowledgment_tokens = data_acknowledgment_tokens
         self.logger = logger or DummyLogger(__name__)
 
     @property

@@ -1,6 +1,21 @@
 Release History
 ===============
 
+4.5.0 (unreleased)
+------------------
+
+**API Changes (Backward Compatible)**
+
+- Added an optional token-based flow control acknowledgment mode, enabled
+  with the new ``data_acknowledgment_tokens`` setting on
+  ``H2Configuration``. When enabled, each ``DataReceived`` event carries a
+  single-use ``DataAcknowledgment`` token that hands the flow-controlled
+  bytes (including padding) back to the remote peer as the application
+  consumes the payload, either incrementally or all at once. Tokens reject
+  duplicate or excessive acknowledgments and cannot be used on a different
+  connection, and the manual ``acknowledge_received_data`` API is disabled
+  in this mode to prevent acknowledging the same data twice.
+
 4.4.1 (2026-08-03)
 ------------------
 

@@ -30,6 +30,7 @@ class TestH2Config:
         "normalize_outbound_headers",
         "validate_inbound_headers",
         "normalize_inbound_headers",
+        "data_acknowledgment_tokens",
     ]
 
     @pytest.mark.parametrize("option_name", boolean_config_options)
