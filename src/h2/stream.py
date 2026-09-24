@@ -865,16 +865,16 @@ class H2Stream:
         """
         self.config.logger.debug("Send headers %s on %r", headers, self)
 
-        # Because encoding headers makes an irreversible change to the header
-        # compression context, we make the state transition before we encode
-        # them.
+        # Materialize the headers exactly once: the caller may hand us an
+        # iterable that can only be consumed a single time, and we need the
+        # headers for both validation and encoding. This preserves the
+        # HeaderTuple types, so "never indexed" markers are kept.
+        bytes_headers = utf8_encode_headers(headers)
 
         # First, check if we're a client. If we are, no problem: if we aren't,
         # we need to scan the header block to see if this is an informational
         # response.
         input_ = StreamInputs.SEND_HEADERS
-
-        bytes_headers = utf8_encode_headers(headers)
 
         if ((not self.state_machine.client) and
                 is_informational_response(bytes_headers)):
@@ -884,12 +884,24 @@ class H2Stream:
 
             input_ = StreamInputs.SEND_INFORMATIONAL_HEADERS
 
-        events = self.state_machine.process_input(input_)
+        # Normalize and validate the header block *before* making any state
+        # changes. Both the state transition and encoding the headers (which
+        # updates the HPACK compression context) are irreversible, so a
+        # header block that we reject must not be allowed to leave either of
+        # those changes behind.
+        hdr_validation_flags = self._outbound_hdr_validation_flags(input_)
+        prepared_headers = self._prepare_outbound_headers(
+            bytes_headers, hdr_validation_flags,
+        )
+
+        # Nothing below this line can fail because of the header block, so
+        # it is now safe to transition the state machine and to encode the
+        # headers into the compression context.
+        self.state_machine.process_input(input_)
 
         hf = HeadersFrame(self.stream_id)
-        hdr_validation_flags = self._build_hdr_validation_flags(events)
         frames = self._build_headers_frames(
-            bytes_headers, encoder, hf, hdr_validation_flags,
+            prepared_headers, encoder, hf,
         )
 
         if end_stream:
@@ -933,9 +945,12 @@ class H2Stream:
         hdr_validation_flags = self._build_hdr_validation_flags(events)
 
         bytes_headers = utf8_encode_headers(headers)
+        prepared_headers = self._prepare_outbound_headers(
+            bytes_headers, hdr_validation_flags,
+        )
 
         return self._build_headers_frames(
-            bytes_headers, encoder, ppf, hdr_validation_flags,
+            prepared_headers, encoder, ppf,
         )
 
 
@@ -1282,14 +1297,44 @@ class H2Stream:
             is_push_promise=is_push_promise,
         )
 
-    def _build_headers_frames(self,
-                              headers: Iterable[Header],
-                              encoder: Encoder,
-                              first_frame: HeadersFrame | PushPromiseFrame,
-                              hdr_validation_flags: HeaderValidationFlags) \
-            -> list[HeadersFrame | ContinuationFrame | PushPromiseFrame]:
+    def _outbound_hdr_validation_flags(self, input_: StreamInputs) -> HeaderValidationFlags:
         """
-        Helper method to build headers or push promise frames.
+        Constructs the header validation flags for a header block we are
+        about to send, without advancing the stream state machine. This
+        mirrors the flags that would be derived from the events emitted by
+        the state transition, so that the header block can be validated
+        before any state is changed.
+        """
+        # If we have already sent headers on this stream, this header block
+        # is a trailer block. Informational responses do not set
+        # ``headers_sent``, so this matches the events the state machine
+        # would emit for the transition.
+        is_trailer = bool(self.state_machine.headers_sent)
+
+        # On an idle stream the state machine has not recorded which side of
+        # the connection we are. Sending headers opens such a stream as a
+        # request, mirroring ``request_sent``.
+        client = self.state_machine.client
+        if client is None:
+            client = input_ is StreamInputs.SEND_HEADERS
+
+        return HeaderValidationFlags(
+            is_client=client,
+            is_trailer=is_trailer,
+            is_response_header=(not client) and not is_trailer,
+            is_push_promise=False,
+        )
+
+    def _prepare_outbound_headers(self,
+                                  headers: Iterable[Header],
+                                  hdr_validation_flags: HeaderValidationFlags) -> list[Header]:
+        """
+        Normalizes and validates a header block we are about to send,
+        returning the result as a list.
+
+        This is done eagerly, before any state is changed and before the
+        headers are encoded into the HPACK compression context, so that
+        rejecting a header block does not leave partial state behind.
         """
         # We need to lowercase the header names, and to ensure that secure
         # header fields are kept out of compression contexts.
@@ -1306,6 +1351,17 @@ class H2Stream:
                 headers, hdr_validation_flags,
             )
 
+        return list(headers)
+
+    def _build_headers_frames(self,
+                              headers: Iterable[Header],
+                              encoder: Encoder,
+                              first_frame: HeadersFrame | PushPromiseFrame) \
+            -> list[HeadersFrame | ContinuationFrame | PushPromiseFrame]:
+        """
+        Helper method to build headers or push promise frames from a header
+        block that has already been normalized and validated.
+        """
         encoded_headers = encoder.encode(headers)
 
         # Slice into blocks of max_outbound_frame_size. Be careful with this:

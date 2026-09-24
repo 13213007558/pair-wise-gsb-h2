@@ -1,6 +1,17 @@
 Release History
 ===============
 
+Unreleased
+----------
+
+**Bugfixes**
+
+- ``H2Connection.send_headers`` is now atomic for locally-rejected calls: a
+  call that fails argument or header validation before emitting any bytes no
+  longer consumes the stream ID, no longer adds entries to the HPACK dynamic
+  table, and no longer advances the state of an existing stream. The stream
+  can immediately be retried with valid arguments.
+
 4.4.1 (2026-08-03)
 ------------------
 

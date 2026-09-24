@@ -800,17 +800,10 @@ class H2Connection:
                 msg = f"Max outbound streams is {max_open_streams}, {value} open"
                 raise TooManyStreamsError(msg)
 
-        self.state_machine.process_input(ConnectionInputs.SEND_HEADERS)
-        stream = self._get_or_create_stream(
-            stream_id, AllowedStreamIDs(self.config.client_side),
-        )
-
-        frames: list[Frame] = []
-        frames.extend(stream.send_headers(
-            headers, self.encoder, end_stream,
-        ))
-
-        # We may need to send priority information.
+        # We may need to send priority information. Validate the priority
+        # arguments before making any state changes, so that a rejected call
+        # does not consume a stream ID, change the state of an existing
+        # stream, or emit a partial header block.
         priority_present = (
             (priority_weight is not None) or
             (priority_depends_on is not None) or
@@ -822,6 +815,45 @@ class H2Connection:
                 msg = "Servers SHOULD NOT prioritize streams."
                 raise RFC1122Error(msg)
 
+            _validate_priority(
+                stream_id, priority_weight, priority_depends_on,
+            )
+
+        self.state_machine.process_input(ConnectionInputs.SEND_HEADERS)
+
+        stream = self.streams.get(stream_id)
+        if stream is None:
+            # Roll back the stream creation if sending the headers fails: a
+            # call that has not emitted any bytes must not consume the
+            # stream ID.
+            outbound = self._stream_id_is_outbound(stream_id)
+            highest_stream_id = (
+                self.highest_outbound_stream_id if outbound else
+                self.highest_inbound_stream_id
+            )
+            stream = self._begin_new_stream(
+                stream_id, AllowedStreamIDs(self.config.client_side),
+            )
+            try:
+                new_frames = stream.send_headers(
+                    headers, self.encoder, end_stream,
+                )
+            except Exception:
+                del self.streams[stream_id]
+                if outbound:
+                    self.highest_outbound_stream_id = highest_stream_id
+                else:
+                    self.highest_inbound_stream_id = highest_stream_id
+                raise
+        else:
+            new_frames = stream.send_headers(
+                headers, self.encoder, end_stream,
+            )
+
+        frames: list[Frame] = []
+        frames.extend(new_frames)
+
+        if priority_present:
             headers_frame = frames[0]
             assert isinstance(headers_frame, HeadersFrame)
 
@@ -2067,18 +2099,11 @@ def _add_frame_priority(frame: PriorityFrame | HeadersFrame,
 
     This method validates the input values.
     """
-    # A stream may not depend on itself.
-    if depends_on == frame.stream_id:
-        msg = f"Stream {frame.stream_id} may not depend on itself"
-        raise ProtocolError(msg)
+    _validate_priority(frame.stream_id, weight, depends_on)
 
-    # Weight must be between 1 and 256.
+    # Weight is an integer between 1 and 256, but the byte only allows
+    # 0 to 255: subtract one.
     if weight is not None:
-        if weight > 256 or weight < 1:
-            msg = f"Weight must be between 1 and 256, not {weight}"
-            raise ProtocolError(msg)
-        # Weight is an integer between 1 and 256, but the byte only allows
-        # 0 to 255: subtract one.
         weight -= 1
 
     # Set defaults for anything not provided.
@@ -2091,6 +2116,23 @@ def _add_frame_priority(frame: PriorityFrame | HeadersFrame,
     frame.exclusive = exclusive
 
     return frame
+
+
+def _validate_priority(stream_id: int,
+                       weight: int | None = None,
+                       depends_on: int | None = None) -> None:
+    """
+    Validates stream priority arguments without applying them to a frame.
+    """
+    # A stream may not depend on itself.
+    if depends_on == stream_id:
+        msg = f"Stream {stream_id} may not depend on itself"
+        raise ProtocolError(msg)
+
+    # Weight must be between 1 and 256.
+    if weight is not None and (weight > 256 or weight < 1):
+        msg = f"Weight must be between 1 and 256, not {weight}"
+        raise ProtocolError(msg)
 
 
 def _decode_headers(decoder: Decoder, encoded_header_block: bytes) -> Iterable[Header]:
