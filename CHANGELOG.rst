@@ -1,6 +1,22 @@
 Release History
 ===============
 
+4.5.0 (unreleased)
+------------------
+
+**API Changes (Backward Compatible)**
+
+- Added the ``soft_header_list_size`` option to ``H2Configuration``. When
+  set, a received HEADERS, CONTINUATION, or PUSH_PROMISE block whose
+  decompressed header list (as measured by RFC 7541 Section 4.1) exceeds
+  this application-level limit causes only the offending stream to be
+  reset with ``REFUSED_STREAM``: the header block is still fully consumed
+  and decoded so the HPACK dynamic table stays in sync, the rejected
+  headers are never surfaced to the application, and all other streams on
+  the connection continue unaffected. The connection-level hard limit
+  enforced by the HPACK decoder's ``max_header_list_size`` is unchanged
+  and still terminates the connection when breached.
+
 4.4.1 (2026-08-03)
 ------------------
 

@@ -149,6 +149,26 @@ class H2Configuration:
         .. versionadded:: 2.6.0
 
     :type logger: ``logging.Logger``
+
+    :param soft_header_list_size: An application-level limit on the
+        decompressed size of a header list, measured as defined in
+        RFC 7541 Section 4.1 (the sum of the name and value lengths in
+        bytes, plus 32 bytes of overhead per field). When a received
+        HEADERS, CONTINUATION, or PUSH_PROMISE block decompresses to a
+        header list larger than this value, only the offending stream is
+        rejected with a RST_STREAM frame: the header block is still fully
+        consumed and decoded so that the HPACK dynamic table stays in
+        sync, and the connection remains usable for all other streams.
+        This is a softer, per-stream complement to the connection-level
+        hard limit enforced via the HPACK decoder's
+        ``max_header_list_size`` (advertised to the peer with the
+        SETTINGS_MAX_HEADER_LIST_SIZE setting), which continues to
+        terminate the connection when exceeded. Defaults to ``None``,
+        meaning no soft limit is applied.
+
+        .. versionadded:: 4.5.0
+
+    :type soft_header_list_size: ``int`` or ``None``
     """
 
     client_side = _BooleanConfigOption("client_side")
@@ -176,7 +196,8 @@ class H2Configuration:
                  split_outbound_cookies: bool = False,
                  validate_inbound_headers: bool = True,
                  normalize_inbound_headers: bool = True,
-                 logger: DummyLogger | OutputLogger | None = None) -> None:
+                 logger: DummyLogger | OutputLogger | None = None,
+                 soft_header_list_size: int | None = None) -> None:
         self.client_side = client_side
         self.header_encoding = header_encoding
         self.validate_outbound_headers = validate_outbound_headers
@@ -185,6 +206,7 @@ class H2Configuration:
         self.validate_inbound_headers = validate_inbound_headers
         self.normalize_inbound_headers = normalize_inbound_headers
         self.logger = logger or DummyLogger(__name__)
+        self.soft_header_list_size = soft_header_list_size
 
     @property
     def header_encoding(self) -> bool | str | None:
@@ -210,3 +232,27 @@ class H2Configuration:
             msg = "header_encoding cannot be True"
             raise ValueError(msg)
         self._header_encoding = value
+
+    @property
+    def soft_header_list_size(self) -> int | None:
+        """
+        The application-level soft limit on the decompressed size of a
+        received header list, or ``None`` if no soft limit applies.
+        Streams whose header lists exceed this size are reset without
+        affecting the rest of the connection.
+        """
+        return self._soft_header_list_size
+
+    @soft_header_list_size.setter
+    def soft_header_list_size(self, value: int | None) -> None:
+        """
+        Enforces constraints on the value of the soft header list size.
+        """
+        if value is not None:
+            if not isinstance(value, int) or isinstance(value, bool):
+                msg = "soft_header_list_size must be an int or None"
+                raise ValueError(msg)
+            if value < 0:
+                msg = "soft_header_list_size cannot be negative"
+                raise ValueError(msg)
+        self._soft_header_list_size = value
