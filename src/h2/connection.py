@@ -792,6 +792,27 @@ class H2Connection:
             "Send headers on stream ID %d", stream_id,
         )
 
+        # We may need to send priority information.
+        priority_present = (
+            (priority_weight is not None) or
+            (priority_depends_on is not None) or
+            (priority_exclusive is not None)
+        )
+
+        # Validate the priority arguments up front: a call that is rejected
+        # for invalid local arguments must not create streams, advance any
+        # stream state, or change the header compression context.
+        if priority_present:
+            if not self.config.client_side:
+                msg = "Servers SHOULD NOT prioritize streams."
+                raise RFC1122Error(msg)
+            if priority_depends_on == stream_id:
+                msg = f"Stream {stream_id} may not depend on itself"
+                raise ProtocolError(msg)
+            if priority_weight is not None and not 1 <= priority_weight <= 256:
+                msg = f"Weight must be between 1 and 256, not {priority_weight}"
+                raise ProtocolError(msg)
+
         # Check we can open the stream.
         if stream_id not in self.streams:
             max_open_streams = self.remote_settings.max_concurrent_streams
@@ -801,27 +822,35 @@ class H2Connection:
                 raise TooManyStreamsError(msg)
 
         self.state_machine.process_input(ConnectionInputs.SEND_HEADERS)
+
+        # If this call creates the stream and then fails before producing
+        # any bytes, the creation is rolled back so that the stream ID is
+        # not consumed by the rejected call.
+        stream_is_new = stream_id not in self.streams
+        outbound = self._stream_id_is_outbound(stream_id)
+        previous_highest_stream_id = (
+            self.highest_outbound_stream_id if outbound else
+            self.highest_inbound_stream_id
+        )
         stream = self._get_or_create_stream(
             stream_id, AllowedStreamIDs(self.config.client_side),
         )
 
         frames: list[Frame] = []
-        frames.extend(stream.send_headers(
-            headers, self.encoder, end_stream,
-        ))
-
-        # We may need to send priority information.
-        priority_present = (
-            (priority_weight is not None) or
-            (priority_depends_on is not None) or
-            (priority_exclusive is not None)
-        )
+        try:
+            frames.extend(stream.send_headers(
+                headers, self.encoder, end_stream,
+            ))
+        except Exception:
+            if stream_is_new:
+                del self.streams[stream_id]
+                if outbound:
+                    self.highest_outbound_stream_id = previous_highest_stream_id
+                else:
+                    self.highest_inbound_stream_id = previous_highest_stream_id
+            raise
 
         if priority_present:
-            if not self.config.client_side:
-                msg = "Servers SHOULD NOT prioritize streams."
-                raise RFC1122Error(msg)
-
             headers_frame = frames[0]
             assert isinstance(headers_frame, HeadersFrame)
 

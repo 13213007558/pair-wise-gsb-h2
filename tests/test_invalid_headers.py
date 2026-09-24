@@ -7,6 +7,7 @@ import itertools
 
 import hyperframe.frame
 import pytest
+from hpack import NeverIndexedHeaderTuple
 from hypothesis import given
 from hypothesis.strategies import binary, lists, tuples
 
@@ -948,3 +949,129 @@ class TestOversizedHeaders:
             last_stream_id=1, error_code=h2.errors.ErrorCodes.PROTOCOL_ERROR,
         )
         assert c.data_to_send() == expected_frame.serialize()
+
+
+
+class TestSendHeadersRollback:
+    """
+    A ``send_headers`` call that is rejected for invalid local arguments
+    before producing any bytes must not consume the stream ID, advance the
+    stream state, or leave new entries in the HPACK dynamic table.
+    """
+
+    base_request_headers = [
+        (":authority", "example.com"),
+        (":path", "/"),
+        (":scheme", "https"),
+        (":method", "GET"),
+        ("user-agent", "someua/0.0.1"),
+    ]
+
+    server_config = h2.config.H2Configuration(client_side=False)
+
+    def dynamic_entries(self, c):
+        return list(c.encoder.header_table.dynamic_entries)
+
+    def test_rejected_calls_leave_no_trace(self, frame_factory) -> None:
+        """
+        Invalid priority arguments, self-dependency, and invalid
+        pseudo-headers are all rejected without changing any connection or
+        stream state, and a subsequent valid request on the same stream ID
+        decodes cleanly on an independent connection.
+        """
+        c = h2.connection.H2Connection()
+        c.initiate_connection()
+        c.clear_outbound_data_buffer()
+
+        invalid_pseudo_headers = [
+            *self.base_request_headers, (":late", "pseudo-header"),
+        ]
+
+        # Invalid priority weight.
+        with pytest.raises(h2.exceptions.ProtocolError):
+            c.send_headers(1, self.base_request_headers, priority_weight=0)
+
+        # Stream may not depend on itself.
+        with pytest.raises(h2.exceptions.ProtocolError):
+            c.send_headers(1, self.base_request_headers, priority_depends_on=1)
+
+        # Pseudo-header after regular headers.
+        with pytest.raises(h2.exceptions.ProtocolError):
+            c.send_headers(1, invalid_pseudo_headers)
+
+        # The rejected calls produced no bytes, consumed no stream ID, and
+        # added nothing to the encoder dynamic table.
+        assert not c.data_to_send()
+        assert 1 not in c.streams
+        assert c.highest_outbound_stream_id == 0
+        assert self.dynamic_entries(c) == []
+
+        # A valid retry on the same stream ID succeeds, even when headers
+        # are a one-shot iterable carrying a never-indexed sensitive header.
+        sensitive_header = NeverIndexedHeaderTuple("authorization", "secret")
+        one_shot_headers = (
+            header for header in [*self.base_request_headers, sensitive_header]
+        )
+        c.send_headers(1, one_shot_headers, end_stream=True)
+
+        # The sensitive header was sent never-indexed: it must not appear in
+        # the encoder dynamic table.
+        assert all(
+            entry[0] != b"authorization" for entry in self.dynamic_entries(c)
+        )
+
+        # An independent connection receives the complete request: the
+        # rejected calls must not have desynchronized the compression
+        # context.
+        server = h2.connection.H2Connection(config=self.server_config)
+        server.initiate_connection()
+        server.receive_data(frame_factory.preamble())
+        events = server.receive_data(c.data_to_send())
+
+        request_received = next(
+            event for event in events
+            if isinstance(event, h2.events.RequestReceived)
+        )
+        assert request_received.stream_id == 1
+        assert request_received.headers == [
+            (b":authority", b"example.com"),
+            (b":path", b"/"),
+            (b":scheme", b"https"),
+            (b":method", b"GET"),
+            (b"user-agent", b"someua/0.0.1"),
+            (b"authorization", b"secret"),
+        ]
+        assert any(
+            isinstance(event, h2.events.StreamEnded) for event in events
+        )
+
+    def test_rejected_trailers_leave_stream_state_untouched(self) -> None:
+        """
+        A rejected trailers block on an existing open stream must not
+        advance that stream's state or the compression context.
+        """
+        c = h2.connection.H2Connection()
+        c.initiate_connection()
+        c.clear_outbound_data_buffer()
+        c.send_headers(1, self.base_request_headers)
+        c.clear_outbound_data_buffer()
+
+        stream = c.streams[1]
+        state_before = stream.state_machine._snapshot()
+        dynamic_entries_before = self.dynamic_entries(c)
+
+        # Trailers without END_STREAM are rejected.
+        with pytest.raises(h2.exceptions.ProtocolError):
+            c.send_headers(1, [("x-trailer", "value")])
+
+        # Invalid pseudo-headers in trailers are rejected.
+        with pytest.raises(h2.exceptions.ProtocolError):
+            c.send_headers(1, [(":path", "/late")], end_stream=True)
+
+        assert stream.state_machine._snapshot() == state_before
+        assert self.dynamic_entries(c) == dynamic_entries_before
+        assert not c.data_to_send()
+
+        # Valid trailers still work afterwards.
+        c.send_headers(1, [("x-trailer", "value")], end_stream=True)
+        assert c.data_to_send()

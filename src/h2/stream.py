@@ -161,6 +161,43 @@ class H2StreamStateMachine:
 
             return []
 
+    def _snapshot(self) -> tuple[
+        StreamState,
+        bool | None, bool | None, bool | None, bool | None,
+        StreamClosedBy | None,
+    ]:
+        """
+        Capture the mutable state of this state machine, so that a failed
+        send can be rolled back by a matching call to ``_restore``.
+        """
+        return (
+            self.state,
+            self.client,
+            self.headers_sent,
+            self.trailers_sent,
+            self.headers_received,
+            self.trailers_received,
+            self.stream_closed_by,
+        )
+
+    def _restore(self, snapshot: tuple[
+        StreamState,
+        bool | None, bool | None, bool | None, bool | None,
+        StreamClosedBy | None,
+    ]) -> None:
+        """
+        Restore the mutable state captured by an earlier ``_snapshot`` call.
+        """
+        (
+            self.state,
+            self.client,
+            self.headers_sent,
+            self.trailers_sent,
+            self.headers_received,
+            self.trailers_received,
+            self.stream_closed_by,
+        ) = snapshot
+
     def request_sent(self, previous_state: StreamState) -> list[Event]:
         """
         Fires when a request is sent.
@@ -884,23 +921,33 @@ class H2Stream:
 
             input_ = StreamInputs.SEND_INFORMATIONAL_HEADERS
 
+        # Take a snapshot of the state machine so that, if the header block
+        # is rejected before any bytes are produced, the stream can be
+        # rolled back to its current state: a rejected call must not advance
+        # the stream or change the header compression context.
+        state_machine_snapshot = self.state_machine._snapshot()
+
         events = self.state_machine.process_input(input_)
 
-        hf = HeadersFrame(self.stream_id)
-        hdr_validation_flags = self._build_hdr_validation_flags(events)
-        frames = self._build_headers_frames(
-            bytes_headers, encoder, hf, hdr_validation_flags,
-        )
+        try:
+            if self.state_machine.trailers_sent and not end_stream:
+                msg = "Trailers must have END_STREAM set."
+                raise ProtocolError(msg)
+
+            hf = HeadersFrame(self.stream_id)
+            hdr_validation_flags = self._build_hdr_validation_flags(events)
+            frames = self._build_headers_frames(
+                bytes_headers, encoder, hf, hdr_validation_flags,
+            )
+        except Exception:
+            self.state_machine._restore(state_machine_snapshot)
+            raise
 
         if end_stream:
             # Not a bug: the END_STREAM flag is valid on the initial HEADERS
             # frame, not the CONTINUATION frames that follow.
             self.state_machine.process_input(StreamInputs.SEND_END_STREAM)
             frames[0].flags.add("END_STREAM")
-
-        if self.state_machine.trailers_sent and not end_stream:
-            msg = "Trailers must have END_STREAM set."
-            raise ProtocolError(msg)
 
         if self.state_machine.client and self._authority is None:
             self._authority = authority_from_headers(bytes_headers)
@@ -1298,13 +1345,16 @@ class H2Stream:
             # headers compression
             should_split_outbound_cookies = self.config.split_outbound_cookies
 
-            headers = normalize_outbound_headers(
+            headers = list(normalize_outbound_headers(
                 headers, hdr_validation_flags, should_split_outbound_cookies,
-            )
+            ))
         if self.config.validate_outbound_headers:
-            headers = validate_outbound_headers(
+            # Materialize the validated headers before encoding them:
+            # encoding irreversibly changes the header compression context,
+            # so validation must finish (and potentially fail) first.
+            headers = list(validate_outbound_headers(
                 headers, hdr_validation_flags,
-            )
+            ))
 
         encoded_headers = encoder.encode(headers)
 
