@@ -74,6 +74,9 @@ Events
 .. autoclass:: h2.events.PriorityUpdated
    :members:
 
+.. autoclass:: h2.events.PriorityUpdateReceived
+   :members:
+
 .. autoclass:: h2.events.ConnectionTerminated
    :members:
 
@@ -81,6 +84,13 @@ Events
    :members:
 
 .. autoclass:: h2.events.UnknownFrameReceived
+   :members:
+
+
+Priority Values
+---------------
+
+.. autoclass:: h2.priority.Priority
    :members:
 
 

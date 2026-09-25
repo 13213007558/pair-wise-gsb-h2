@@ -3,11 +3,14 @@ Helper module for the h2 tests.
 """
 from __future__ import annotations
 
+import struct
+
 from hpack.hpack import Encoder
 from hyperframe.frame import (
     AltSvcFrame,
     ContinuationFrame,
     DataFrame,
+    ExtensionFrame,
     GoAwayFrame,
     HeadersFrame,
     PingFrame,
@@ -178,6 +181,18 @@ class FrameFactory:
         f = AltSvcFrame(stream_id)
         f.origin = origin
         f.field = field
+        return f
+
+    def build_priority_update_frame(self,
+                                    prioritized_stream_id,
+                                    field_value,
+                                    stream_id=0):
+        """
+        Builds a single RFC 9218 PRIORITY_UPDATE frame.
+        """
+        f = ExtensionFrame(type=0x10, stream_id=stream_id)
+        f.body = struct.pack("!L", prioritized_stream_id) + field_value
+        f.body_len = len(f.body)
         return f
 
     def change_table_size(self, new_size) -> None:

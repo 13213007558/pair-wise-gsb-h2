@@ -21,6 +21,7 @@ if TYPE_CHECKING:  # pragma: no cover
     from hyperframe.frame import Frame
 
     from .errors import ErrorCodes
+    from .priority import Priority
 
 
 kw_only = {"kw_only": True}
@@ -556,6 +557,51 @@ class PriorityUpdated(Event):
         return (
             f"<PriorityUpdated stream_id:{self.stream_id}, weight:{self.weight}, depends_on:{self.depends_on}, "
             f"exclusive:{self.exclusive}>"
+        )
+
+
+class PriorityUpdateReceived(Event):
+    """
+    The PriorityUpdateReceived event is fired whenever a PRIORITY_UPDATE
+    frame (RFC 9218) is received for a stream. This frame carries the
+    extensible priority signals (urgency and incrementality) that replace
+    the RFC 7540 dependency tree.
+
+    This event is fired both when the update arrives while the stream is
+    open and when updates that were received before the stream's HEADERS
+    frame are flushed on stream creation. It may also fire for streams that
+    have already closed.
+
+    This event is purely advisory: h2 does not implement a priority
+    scheduler, and does not act on this information in any way.
+
+    Note that this event is entirely independent of the
+    :class:`PriorityUpdated <h2.events.PriorityUpdated>` event, which
+    carries the deprecated RFC 7540 priority tree information. The two
+    priority schemes do not share state.
+
+    This event can only be fired on the server end of a connection: in
+    HTTP/2, PRIORITY_UPDATE frames are only sent by clients.
+
+    .. versionadded:: 4.5.0
+    """
+
+    def __init__(self) -> None:
+        #: The ID of the request stream whose priority is being updated.
+        #: This is the prioritized element ID from the frame, not the ID of
+        #: the stream the frame was received on (which is always zero).
+        self.stream_id: int | None = None
+
+        #: The parsed priority value, as a
+        #: :class:`Priority <h2.priority.Priority>` object. Exposes the
+        #: ``urgency`` and ``incremental`` parameters, along with any
+        #: unknown parameters the peer sent.
+        self.priority: Priority | None = None
+
+    def __repr__(self) -> str:
+        return (
+            f"<PriorityUpdateReceived stream_id:{self.stream_id}, "
+            f"priority:{self.priority!r}>"
         )
 
 
