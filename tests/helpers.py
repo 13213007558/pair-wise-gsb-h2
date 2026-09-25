@@ -18,6 +18,8 @@ from hyperframe.frame import (
     WindowUpdateFrame,
 )
 
+from h2.frame import PriorityUpdateFrame
+
 SAMPLE_SETTINGS = {
     SettingsFrame.HEADER_TABLE_SIZE: 4096,
     SettingsFrame.ENABLE_PUSH: 1,
@@ -169,6 +171,18 @@ class FrameFactory:
         f.depends_on = depends_on
         f.stream_weight = weight
         f.exclusive = exclusive
+        return f
+
+    def build_priority_update_frame(self,
+                                    prioritized_element_id,
+                                    field_value=b"",
+                                    stream_id=0):
+        """
+        Builds a single RFC 9218 PRIORITY_UPDATE frame.
+        """
+        f = PriorityUpdateFrame(stream_id)
+        f.prioritized_element_id = prioritized_element_id
+        f.field_value = field_value
         return f
 
     def build_alt_svc_frame(self, stream_id, origin, field):

@@ -11,9 +11,10 @@ H2 state machine it processes the data and returns a list of Event objects.
 from __future__ import annotations
 
 import binascii
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from .priority import DEFAULT_URGENCY
 from .settings import ChangedSetting, SettingCodes, Settings, _setting_code_from_int
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -556,6 +557,53 @@ class PriorityUpdated(Event):
         return (
             f"<PriorityUpdated stream_id:{self.stream_id}, weight:{self.weight}, depends_on:{self.depends_on}, "
             f"exclusive:{self.exclusive}>"
+        )
+
+
+@dataclass(**kw_only)
+class PriorityUpdateReceived(Event):
+    """
+    The PriorityUpdateReceived event is fired whenever the remote peer sends
+    a PRIORITY_UPDATE frame, as defined by RFC 9218. This frame carries
+    priority information expressed in the extensible prioritization scheme
+    (urgency and incremental), which is independent of the RFC 7540 stream
+    dependency tree reported by the PriorityUpdated event.
+
+    This event is purely advisory: h2 does not act on the priority
+    information it carries, and does not implement a scheduler. The event
+    may refer to a stream that does not exist yet: PRIORITY_UPDATE frames
+    that arrive before the HEADERS or PUSH_PROMISE frame that opens their
+    stream are buffered and re-emitted once the stream appears.
+
+    .. versionadded:: 4.5.0
+    """
+
+    stream_id: int
+    """The ID of the stream whose priority is being updated."""
+
+    urgency: int = DEFAULT_URGENCY
+    """
+    The urgency of the stream: an integer between 0 (most urgent) and 7
+    (least urgent). Defaults to 3 when the peer did not signal a valid
+    urgency.
+    """
+
+    incremental: bool = False
+    """
+    Whether the peer would like the response for this stream to be
+    delivered incrementally. Defaults to False.
+    """
+
+    unknown_parameters: dict[str, Any] = field(default_factory=dict)
+    """
+    Any additional, unrecognized parameters from the priority field value,
+    preserved verbatim so that applications can make use of extensions.
+    """
+
+    def __repr__(self) -> str:
+        return (
+            f"<PriorityUpdateReceived stream_id:{self.stream_id}, urgency:{self.urgency}, "
+            f"incremental:{self.incremental}, unknown_parameters:{self.unknown_parameters}>"
         )
 
 

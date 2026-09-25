@@ -1,6 +1,22 @@
 Release History
 ===============
 
+Unreleased
+----------
+
+**API Changes (Backward Compatible)**
+
+- Added support for the RFC 9218 extensible prioritization scheme:
+  ``H2Connection.send_priority_update`` sends PRIORITY_UPDATE frames, and
+  received PRIORITY_UPDATE frames are surfaced via the new
+  ``h2.events.PriorityUpdateReceived`` event, with the priority field value
+  parsed as an RFC 8941 Structured Fields Dictionary (urgency, incremental,
+  and any unknown parameters). Updates that arrive before their stream's
+  HEADERS or PUSH_PROMISE frame are buffered (in a bounded fashion) and
+  emitted once the stream appears. The RFC 7540 priority tree signaling
+  (PRIORITY frames and HEADERS priority information) is unchanged, and h2
+  continues to leave all scheduling decisions to the application.
+
 4.4.1 (2026-08-03)
 ------------------
 

@@ -21,6 +21,28 @@ combined with the :class:`PriorityUpdated <h2.events.PriorityUpdated>` event fro
 this library, can be used to build a server that conforms to RFC 7540's
 recommendations for priority handling.
 
+Extensible Priorities
+---------------------
+
+.. versionadded:: 4.5.0
+
+`RFC 9218`_ defines a simpler prioritization scheme that replaces the
+RFC 7540 priority tree: each stream is assigned an urgency (an integer
+between 0 and 7) and an incremental flag, signalled with the PRIORITY_UPDATE
+frame.
+
+h2 parses these frames on your behalf and emits a
+:class:`PriorityUpdateReceived <h2.events.PriorityUpdateReceived>` event for
+each one, carrying the target stream ID, the parsed urgency and incremental
+flag, and any unrecognized parameters found in the priority field value.
+Updates that arrive before the HEADERS or PUSH_PROMISE frame that opens
+their stream are buffered and emitted once the stream appears. Just like
+with the RFC 7540 scheme, h2 does not implement a scheduler: acting on the
+priority information is left to the application.
+
+To send priority information to the peer, use
+:meth:`H2Connection.send_priority_update <h2.connection.H2Connection.send_priority_update>`.
+
 Related Events
 --------------
 
@@ -215,6 +237,7 @@ two-tuples.
 
 .. _RFC 7540: https://tools.ietf.org/html/rfc7540
 .. _an implementation: http://python-hyper.org/projects/priority/en/latest/
+.. _RFC 9218: https://www.rfc-editor.org/rfc/rfc9218.html
 
 Flow Control
 ------------
