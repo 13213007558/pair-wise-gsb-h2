@@ -321,6 +321,21 @@ class TestEventReprs:
             "exclusive:True>"
         )
 
+    def test_priorityupdatereceived_repr(self) -> None:
+        """
+        PriorityUpdateReceived has a useful debug representation.
+        """
+        e = h2.events.PriorityUpdateReceived(
+            stream_id=87,
+            urgency=1,
+            incremental=True,
+        )
+
+        assert repr(e) == (
+            "<PriorityUpdateReceived stream_id:87, urgency:1, "
+            "incremental:True, unknown_parameters:{}>"
+        )
+
     @pytest.mark.parametrize(("additional_data", "data_repr"), [
         (None, "None"),
         (b"some data", "736f6d652064617461"),

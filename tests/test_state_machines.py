@@ -53,12 +53,14 @@ class TestConnectionStateMachine:
         [
             h2.connection.ConnectionInputs.RECV_PRIORITY,
             h2.connection.ConnectionInputs.SEND_PRIORITY,
+            h2.connection.ConnectionInputs.RECV_PRIORITY_UPDATE,
+            h2.connection.ConnectionInputs.SEND_PRIORITY_UPDATE,
         ],
     )
     def test_priority_frames_allowed_in_all_states(self, state, input_) -> None:
         """
-        Priority frames can be sent/received in all connection states except
-        closed.
+        Priority frames (RFC 7540 and RFC 9218) can be sent/received in all
+        connection states except closed.
         """
         c = h2.connection.H2ConnectionStateMachine()
         c.state = state

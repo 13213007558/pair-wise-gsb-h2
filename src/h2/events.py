@@ -20,6 +20,8 @@ if TYPE_CHECKING:  # pragma: no cover
     from hpack.struct import Header
     from hyperframe.frame import Frame
 
+    from .priority_update import StructuredFieldItem
+
     from .errors import ErrorCodes
 
 
@@ -556,6 +558,56 @@ class PriorityUpdated(Event):
         return (
             f"<PriorityUpdated stream_id:{self.stream_id}, weight:{self.weight}, depends_on:{self.depends_on}, "
             f"exclusive:{self.exclusive}>"
+        )
+
+
+class PriorityUpdateReceived(Event):
+    """
+    The PriorityUpdateReceived event is fired whenever the remote peer sends
+    a ``PRIORITY_UPDATE`` frame as defined by
+    `RFC 9218 <https://www.rfc-editor.org/rfc/rfc9218>`_.
+
+    Unlike :class:`PriorityUpdated`, this event does not represent an RFC
+    7540 dependency tree update: it only carries the extensible urgency and
+    incremental signals so that applications can build their own scheduler.
+
+    An update may arrive before the stream it targets has been established:
+    h2 retains a bounded number of such early updates and emits this event at
+    the point the stream is opened.
+
+    .. versionadded:: 4.5.0
+    """
+
+    def __init__(
+        self,
+        stream_id: int,
+        urgency: int,
+        incremental: bool,
+        unknown_parameters: dict[str, StructuredFieldItem] | None = None,
+    ) -> None:
+        #: The ID of the stream whose priority is being updated.
+        self.stream_id = stream_id
+
+        #: The stream urgency (RFC 9218 section 4.1), an integer between 0
+        #: and 7. A malformed value is normalised to the default of ``3``.
+        self.urgency = urgency
+
+        #: Whether incremental delivery is preferred. A malformed value is
+        #: normalised to the default of ``False``.
+        self.incremental = incremental
+
+        #: Parameters in the Priority Field Value other than ``urgency`` (``u``)
+        #: and ``incremental`` (``i``), preserved in transmission order so that
+        #: applications can inspect extension-defined members.
+        self.unknown_parameters: dict[str, StructuredFieldItem] = (
+            unknown_parameters if unknown_parameters is not None else {}
+        )
+
+    def __repr__(self) -> str:
+        return (
+            f"<PriorityUpdateReceived stream_id:{self.stream_id}, "
+            f"urgency:{self.urgency}, incremental:{self.incremental}, "
+            f"unknown_parameters:{self.unknown_parameters!r}>"
         )
 
 

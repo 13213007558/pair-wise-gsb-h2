@@ -21,6 +21,47 @@ combined with the :class:`PriorityUpdated <h2.events.PriorityUpdated>` event fro
 this library, can be used to build a server that conforms to RFC 7540's
 recommendations for priority handling.
 
+Extensible Prioritization (RFC 9218)
+------------------------------------
+
+.. versionadded:: 4.5.0
+
+`RFC 9218`_ defines a newer, extensible prioritization scheme for HTTP that
+replaces the RFC 7540 dependency tree with two simple signals per stream:
+an integer ``urgency`` between 0 and 7 and a boolean ``incremental`` hint.
+
+Both signals are carried on the connection in ``PRIORITY_UPDATE`` frames.
+h2 can send these frames with
+:meth:`H2Connection.send_priority_update
+<h2.connection.H2Connection.send_priority_update>` and surfaces received
+frames as :class:`PriorityUpdateReceived
+<h2.events.PriorityUpdateReceived>` events. The frame is only exchanged once
+both peers have advertised the ``SETTINGS_NO_RFC7540_PRIORITIES`` setting
+(code ``9``) with a value of ``1``, available as
+:data:`SettingCodes.NO_RFC7540_PRIORITIES
+<h2.settings.SettingCodes.NO_RFC7540_PRIORITIES>`::
+
+    connection.update_settings({
+        h2.settings.SettingCodes.NO_RFC7540_PRIORITIES: 1,
+    })
+
+As with RFC 7540 priorities, h2 does not implement a scheduler: the
+``urgency`` and ``incremental`` values are delivered to the application and
+never converted into dependency tree state. Unknown members of the frame's
+Structured Fields value are preserved on the event in
+:data:`PriorityUpdateReceived.unknown_parameters
+<h2.events.PriorityUpdateReceived.unknown_parameters>` so that applications
+can interpret parameters defined by later extensions.
+
+A ``PRIORITY_UPDATE`` may arrive before the stream it targets has been
+established. h2 retains the most recent update for each not-yet-open stream,
+up to a bounded limit
+(:data:`H2Connection.MAX_PENDING_PRIORITY_UPDATES
+<h2.connection.H2Connection.MAX_PENDING_PRIORITY_UPDATES>`), and emits the
+event when the stream is opened. Updates for closed streams are discarded,
+and retained updates are released when the connection receives a GOAWAY or is
+closed.
+
 Related Events
 --------------
 
@@ -214,6 +255,7 @@ objects are unordered. For this reason, we require that you provide a list of
 two-tuples.
 
 .. _RFC 7540: https://tools.ietf.org/html/rfc7540
+.. _RFC 9218: https://www.rfc-editor.org/rfc/rfc9218
 .. _an implementation: http://python-hyper.org/projects/priority/en/latest/
 
 Flow Control

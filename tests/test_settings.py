@@ -392,6 +392,26 @@ class TestSettings:
         assert e.value.error_code == h2.errors.ErrorCodes.PROTOCOL_ERROR
         assert s[h2.settings.SettingCodes.ENABLE_CONNECT_PROTOCOL] == 0
 
+    @given(integers())
+    def test_cannot_set_invalid_values_for_no_rfc7540_priorities(self, val) -> None:
+        """
+        SETTINGS_NO_RFC7540_PRIORITIES only allows two values: 0, 1.
+        """
+        assume(val not in (0, 1))
+        s = h2.settings.Settings()
+
+        with pytest.raises(h2.exceptions.InvalidSettingsValueError) as e:
+            s[h2.settings.SettingCodes.NO_RFC7540_PRIORITIES] = val
+
+        s.acknowledge()
+        assert e.value.error_code == h2.errors.ErrorCodes.PROTOCOL_ERROR
+
+        # The same rejection applies to values advertised by a peer.
+        with pytest.raises(h2.exceptions.InvalidSettingsValueError):
+            s.validate_received_setting(
+                h2.settings.SettingCodes.NO_RFC7540_PRIORITIES, val,
+            )
+
 
 class TestSettingsEquality:
     """

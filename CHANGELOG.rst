@@ -1,6 +1,21 @@
 Release History
 ===============
 
+4.5.0 (unreleased)
+------------------
+
+**API Changes (Backward Compatible)**
+
+- Add support for the RFC 9218 ``PRIORITY_UPDATE`` frame (type ``0x10``) and
+  the ``SETTINGS_NO_RFC7540_PRIORITIES`` setting (code ``9``). New
+  ``H2Connection.send_priority_update()`` emits the frame, and received frames
+  surface as ``events.PriorityUpdateReceived`` carrying ``stream_id``,
+  ``urgency``, ``incremental`` and any unknown Structured Fields parameters.
+  Early updates for not-yet-established streams are retained in a bounded
+  per-connection map and delivered when the stream opens; updates for closed
+  streams and connections that received GOAWAY are discarded. The new signal
+  is never translated into RFC 7540 dependency tree state.
+
 4.4.1 (2026-08-03)
 ------------------
 

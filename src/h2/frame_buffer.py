@@ -10,9 +10,16 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from hyperframe.exceptions import InvalidDataError, InvalidFrameError
-from hyperframe.frame import ContinuationFrame, Frame, HeadersFrame, PushPromiseFrame
+from hyperframe.frame import (
+    ContinuationFrame,
+    ExtensionFrame,
+    Frame,
+    HeadersFrame,
+    PushPromiseFrame,
+)
 
 from .exceptions import FrameDataMissingError, FrameTooLargeError, ProtocolError
+from .priority_update import PRIORITY_UPDATE_FRAME_TYPE, PriorityUpdateFrame
 
 if TYPE_CHECKING:  # pragma: no cover
     from ._typing import Buffer
@@ -70,6 +77,22 @@ class FrameBuffer:
         if length > self.max_frame_size:
             msg = f"Received overlong frame: length {length}, max {self.max_frame_size}"
             raise FrameTooLargeError(msg)
+
+    def _upgrade_known_extension_frame(self, frame: Frame) -> Frame:
+        """
+        hyperframe represents frames whose type it does not know as a generic
+        ExtensionFrame. RFC 9218's PRIORITY_UPDATE (type 0x10) is one such
+        frame: reparse it using h2's dedicated class so that the connection
+        layer can validate and dispatch it specifically.
+        """
+        if (
+            type(frame) is ExtensionFrame
+            and frame.type == PRIORITY_UPDATE_FRAME_TYPE
+        ):
+            upgraded = PriorityUpdateFrame(stream_id=frame.stream_id)
+            upgraded.parse_flags(frame.flag_byte)
+            return upgraded
+        return frame
 
     def _update_header_buffer(self, f: Frame | None) -> Frame | None:
         """
@@ -132,6 +155,12 @@ class FrameBuffer:
         try:
             f, length = Frame.parse_frame_header(memoryview(self._data[:9]))
         except (InvalidDataError, InvalidFrameError) as err:  # pragma: no cover
+            msg = f"Received frame with invalid header: {err!s}"
+            raise ProtocolError(msg) from err
+
+        try:
+            f = self._upgrade_known_extension_frame(f)
+        except InvalidDataError as err:
             msg = f"Received frame with invalid header: {err!s}"
             raise ProtocolError(msg) from err
 

@@ -18,6 +18,8 @@ from hyperframe.frame import (
     WindowUpdateFrame,
 )
 
+from h2.priority_update import PriorityUpdateFrame
+
 SAMPLE_SETTINGS = {
     SettingsFrame.HEADER_TABLE_SIZE: 4096,
     SettingsFrame.ENABLE_PUSH: 1,
@@ -169,6 +171,29 @@ class FrameFactory:
         f.depends_on = depends_on
         f.stream_weight = weight
         f.exclusive = exclusive
+        return f
+
+    def build_priority_update_frame(
+        self,
+        stream_id,
+        urgency=3,
+        incremental=False,
+        priority_field_value=None,
+    ):
+        """
+        Builds a single RFC 9218 PRIORITY_UPDATE frame.
+
+        ``stream_id`` is the prioritized stream ID carried inside the frame
+        body. ``priority_field_value`` overrides the synthesized field value.
+        """
+        f = PriorityUpdateFrame(stream_id=0)
+        f.prioritized_stream_id = stream_id
+        if priority_field_value is None:
+            f.priority_field_value = (
+                f"u={urgency}" + (", i" if incremental else "")
+            ).encode("ascii")
+        else:
+            f.priority_field_value = priority_field_value
         return f
 
     def build_alt_svc_frame(self, stream_id, origin, field):
