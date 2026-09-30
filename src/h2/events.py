@@ -639,6 +639,56 @@ class AlternativeServiceAvailable(Event):
 
 
 @dataclass(**kw_only)
+class PriorityUpdateReceived(Event):
+    """
+    The PriorityUpdateReceived event is fired when the remote peer sends a
+    PRIORITY_UPDATE frame, defined in RFC 9218 section 6. This is the
+    extensible prioritization scheme that replaces the RFC 7540 priority
+    tree signaled by :class:`PriorityUpdated <h2.events.PriorityUpdated>`
+    and is deliberately kept separate from it: this event never populates
+    the old dependency-tree fields (weight, depends_on, exclusive).
+
+    h2 only conveys the priority signal. It does not act on it: scheduling
+    responses according to these priorities is left to the application.
+
+    If the peer sends an update for a stream that has not been opened yet,
+    h2 retains the most recent update (bounded by
+    `H2Connection.MAX_PENDING_PRIORITY_UPDATES`) and fires this event
+    once the stream is opened.
+
+    .. versionadded:: 4.5.0
+    """
+
+    #: The ID of the stream whose priority is being updated. This is the
+    #: "Prioritized Element ID" from RFC 9218 section 6.
+    stream_id: int
+
+    #: The urgency of the stream: an integer between 0 (most urgent) and 7
+    #: (least urgent). Defaults to 3 when the peer omits the parameter or
+    #: sends an invalid value.
+    urgency: int
+
+    #: Whether the response can be processed incrementally, as defined in
+    #: RFC 9218 section 4.2. Defaults to ``False``.
+    incremental: bool
+
+    #: Parameters from the priority field value that h2 does not
+    #: understand, mapped to their raw unparsed values (``None`` for bare
+    #: keys). Preserved so applications can inspect extension parameters.
+    unknown_parameters: dict[str, str | None]
+
+    #: The raw priority field value exactly as received, in case the
+    #: application wants to re-parse it with a full RFC 8941 parser.
+    field_value: bytes
+
+    def __repr__(self) -> str:
+        return (
+            f"<PriorityUpdateReceived stream_id:{self.stream_id}, "
+            f"urgency:{self.urgency}, incremental:{self.incremental}>"
+        )
+
+
+@dataclass(**kw_only)
 class UnknownFrameReceived(Event):
     """
     The UnknownFrameReceived event is fired when the remote peer sends a frame

@@ -55,6 +55,16 @@ class SettingCodes(enum.IntEnum):
     #: client set this to 1.
     ENABLE_CONNECT_PROTOCOL = SettingsFrame.ENABLE_CONNECT_PROTOCOL
 
+    #: This setting, defined in RFC 9218 section 3, indicates that the sender
+    #: does not support the RFC 7540 priority scheme (the dependency tree
+    #: signaled by PRIORITY frames) and will ignore it. Endpoints can use it
+    #: to signal that they use the extensible prioritization scheme instead.
+    #: A value of 0 means RFC 7540 priorities are supported; a value of 1
+    #: means they are not.
+    #:
+    #: .. versionadded:: 4.5.0
+    NO_RFC7540_PRIORITIES = 0x09
+
 
 def _setting_code_from_int(code: int) -> SettingCodes | int:
     """
@@ -357,7 +367,13 @@ def _validate_setting(
     elif setting == SettingCodes.MAX_HEADER_LIST_SIZE:
         if value < 0:
             return ErrorCodes.PROTOCOL_ERROR
-    elif setting == SettingCodes.ENABLE_CONNECT_PROTOCOL and value not in (0, 1):
+    elif setting in (
+        SettingCodes.ENABLE_CONNECT_PROTOCOL,
+        SettingCodes.NO_RFC7540_PRIORITIES,
+    ) and value not in (0, 1):
+        # RFC 9218 section 3: "A SETTINGS_NO_RFC7540_PRIORITIES value other
+        # than 0 or 1 MUST be treated as a connection error [...] of type
+        # PROTOCOL_ERROR."
         return ErrorCodes.PROTOCOL_ERROR
 
     return ErrorCodes.NO_ERROR

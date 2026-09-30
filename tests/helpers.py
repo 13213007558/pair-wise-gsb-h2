@@ -171,6 +171,20 @@ class FrameFactory:
         f.exclusive = exclusive
         return f
 
+    def build_priority_update_frame(self,
+                                    prioritized_stream_id,
+                                    field_value=b"",
+                                    stream_id=0):
+        """
+        Builds a single RFC 9218 PRIORITY_UPDATE frame.
+        """
+        from h2.priority import PriorityUpdateFrame
+
+        f = PriorityUpdateFrame(stream_id=stream_id)
+        f.prioritized_stream_id = prioritized_stream_id
+        f.field_value = field_value
+        return f
+
     def build_alt_svc_frame(self, stream_id, origin, field):
         """
         Builds a single ALTSVC frame.

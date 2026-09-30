@@ -10,9 +10,16 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from hyperframe.exceptions import InvalidDataError, InvalidFrameError
-from hyperframe.frame import ContinuationFrame, Frame, HeadersFrame, PushPromiseFrame
+from hyperframe.frame import (
+    ContinuationFrame,
+    ExtensionFrame,
+    Frame,
+    HeadersFrame,
+    PushPromiseFrame,
+)
 
 from .exceptions import FrameDataMissingError, FrameTooLargeError, ProtocolError
+from .priority import PRIORITY_UPDATE_FRAME_TYPE, PriorityUpdateFrame
 
 if TYPE_CHECKING:  # pragma: no cover
     from ._typing import Buffer
@@ -134,6 +141,14 @@ class FrameBuffer:
         except (InvalidDataError, InvalidFrameError) as err:  # pragma: no cover
             msg = f"Received frame with invalid header: {err!s}"
             raise ProtocolError(msg) from err
+
+        # hyperframe wraps frame types it does not know in a generic
+        # ExtensionFrame. Unwrap the ones h2 understands natively, such as
+        # the RFC 9218 PRIORITY_UPDATE frame.
+        if isinstance(f, ExtensionFrame) and f.type == PRIORITY_UPDATE_FRAME_TYPE:
+            priority_update_frame = PriorityUpdateFrame(stream_id=f.stream_id)
+            priority_update_frame.parse_flags(f.flag_byte)
+            f = priority_update_frame
 
         # Next, check that we have enough length to parse the frame body. If
         # not, bail, leaving the frame header data in the buffer for next time.

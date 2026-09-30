@@ -39,6 +39,7 @@ from .events import (
     PingAckReceived,
     PingReceived,
     PriorityUpdated,
+    PriorityUpdateReceived,
     RemoteSettingsChanged,
     RequestReceived,
     ResponseReceived,
@@ -60,6 +61,13 @@ from .exceptions import (
     TooManyStreamsError,
 )
 from .frame_buffer import FrameBuffer
+from .priority import (
+    MAX_URGENCY,
+    MIN_URGENCY,
+    PriorityUpdateFrame,
+    build_priority_field_value,
+    parse_priority_field_value,
+)
 from .settings import ChangedSetting, SettingCodes, Settings
 from .stream import H2Stream, StreamClosedBy
 from .utilities import SizeLimitDict, guard_increment_window
@@ -101,6 +109,8 @@ class ConnectionInputs(Enum):
     RECV_PRIORITY = 17
     SEND_ALTERNATIVE_SERVICE = 18  # Added in 2.3.0
     RECV_ALTERNATIVE_SERVICE = 19  # Added in 2.3.0
+    SEND_PRIORITY_UPDATE = 20  # Added in 4.5.0
+    RECV_PRIORITY_UPDATE = 21  # Added in 4.5.0
 
 
 class AllowedStreamIDs(IntEnum):
@@ -154,6 +164,10 @@ class H2ConnectionStateMachine:
             (None, ConnectionState.IDLE),
         (ConnectionState.IDLE, ConnectionInputs.RECV_PRIORITY):
             (None, ConnectionState.IDLE),
+        (ConnectionState.IDLE, ConnectionInputs.SEND_PRIORITY_UPDATE):
+            (None, ConnectionState.IDLE),
+        (ConnectionState.IDLE, ConnectionInputs.RECV_PRIORITY_UPDATE):
+            (None, ConnectionState.IDLE),
         (ConnectionState.IDLE, ConnectionInputs.SEND_ALTERNATIVE_SERVICE):
             (None, ConnectionState.SERVER_OPEN),
         (ConnectionState.IDLE, ConnectionInputs.RECV_ALTERNATIVE_SERVICE):
@@ -194,6 +208,10 @@ class H2ConnectionStateMachine:
             (None, ConnectionState.CLIENT_OPEN),
         (ConnectionState.CLIENT_OPEN, ConnectionInputs.RECV_PRIORITY):
             (None, ConnectionState.CLIENT_OPEN),
+        (ConnectionState.CLIENT_OPEN, ConnectionInputs.SEND_PRIORITY_UPDATE):
+            (None, ConnectionState.CLIENT_OPEN),
+        (ConnectionState.CLIENT_OPEN, ConnectionInputs.RECV_PRIORITY_UPDATE):
+            (None, ConnectionState.CLIENT_OPEN),
         (ConnectionState.CLIENT_OPEN,
             ConnectionInputs.RECV_ALTERNATIVE_SERVICE):
                 (None, ConnectionState.CLIENT_OPEN),
@@ -230,6 +248,10 @@ class H2ConnectionStateMachine:
         (ConnectionState.SERVER_OPEN, ConnectionInputs.RECV_PRIORITY):
             (None, ConnectionState.SERVER_OPEN),
         (ConnectionState.SERVER_OPEN, ConnectionInputs.SEND_RST_STREAM):
+            (None, ConnectionState.SERVER_OPEN),
+        (ConnectionState.SERVER_OPEN, ConnectionInputs.SEND_PRIORITY_UPDATE):
+            (None, ConnectionState.SERVER_OPEN),
+        (ConnectionState.SERVER_OPEN, ConnectionInputs.RECV_PRIORITY_UPDATE):
             (None, ConnectionState.SERVER_OPEN),
         (ConnectionState.SERVER_OPEN, ConnectionInputs.RECV_RST_STREAM):
             (None, ConnectionState.SERVER_OPEN),
@@ -322,6 +344,13 @@ class H2Connection:
     # Keep in memory limited amount of results for streams closes
     MAX_CLOSED_STREAMS = 2**16
 
+    # The maximum number of RFC 9218 PRIORITY_UPDATE frames to retain for
+    # streams that have not been opened yet. This bounds the memory a peer
+    # can make us use by sending priority updates for idle streams, as
+    # recommended by RFC 9218 section 6. When the limit is exceeded, the
+    # oldest retained updates are discarded.
+    MAX_PENDING_PRIORITY_UPDATES = 2**12
+
     def __init__(self, config: H2Configuration | None = None) -> None:
         self.state_machine = H2ConnectionStateMachine()
         self.streams: dict[int, H2Stream] = {}
@@ -396,6 +425,15 @@ class H2Connection:
             size_limit=self.MAX_CLOSED_STREAMS,
         )
 
+        # The most recent RFC 9218 priority update received for each stream
+        # that has not been opened yet, keyed by stream ID. Retained updates
+        # are emitted as events when their stream is opened, and discarded
+        # when the stream can no longer be opened. Bounded to avoid
+        # unbounded memory use by a malicious peer.
+        self._pending_priority_updates: dict[int, PriorityUpdateReceived] = (
+            SizeLimitDict(size_limit=self.MAX_PENDING_PRIORITY_UPDATES)
+        )
+
         # The flow control window manager for the connection.
         self._inbound_flow_control_window_manager = WindowManager(
             max_window_size=self.local_settings.initial_window_size,
@@ -411,6 +449,7 @@ class H2Connection:
             PingFrame: self._receive_ping_frame,
             RstStreamFrame: self._receive_rst_stream_frame,
             PriorityFrame: self._receive_priority_frame,
+            PriorityUpdateFrame: self._receive_priority_update_frame,
             GoAwayFrame: self._receive_goaway_frame,
             ContinuationFrame: self._receive_naked_continuation,
             AltSvcFrame: self._receive_alt_svc_frame,
@@ -512,6 +551,16 @@ class H2Connection:
             self.highest_outbound_stream_id = stream_id
         else:
             self.highest_inbound_stream_id = stream_id
+            # Any retained priority updates for lower-numbered streams
+            # refer to streams that can no longer be opened (they are now
+            # implicitly closed): release them.
+            stale_stream_ids = [
+                pending_id
+                for pending_id in self._pending_priority_updates
+                if pending_id < stream_id
+            ]
+            for pending_id in stale_stream_ids:
+                del self._pending_priority_updates[pending_id]
 
         return s
 
@@ -1288,6 +1337,75 @@ class H2Connection:
 
         self._prepare_for_sending([frame_prio])
 
+    def send_priority_update(self,
+                             stream_id: int,
+                             urgency: int | None = None,
+                             incremental: bool | None = None) -> None:
+        """
+        Notify the remote peer about the priority of a stream using the
+        RFC 9218 extensible prioritization scheme.
+
+        This sends a PRIORITY_UPDATE frame (RFC 9218 section 6), which
+        replaces the RFC 7540 priority tree used by :meth:`prioritize
+        <h2.connection.H2Connection.prioritize>`. The two schemes are
+        independent: the urgency and incremental parameters given here are
+        never translated into the old dependency-tree model, and h2 does
+        not schedule data based on them. Priority information is strictly
+        advisory: it only expresses intent to the remote peer.
+
+        Clients may send updates for request streams (streams they
+        initiated); servers may send updates for push streams (streams they
+        promised). The target stream does not need to be open: updates may
+        be sent before the stream is started.
+
+        .. versionadded:: 4.5.0
+
+        :param stream_id: The ID of the stream to prioritize. This is the
+            "Prioritized Element ID" from RFC 9218 section 6.
+        :type stream_id: ``int``
+
+        :param urgency: The urgency of the stream: an integer between 0
+            (most urgent) and 7 (least urgent). If ``None``, no urgency
+            parameter is sent and the peer applies its default (3).
+        :type urgency: ``int`` or ``None``
+
+        :param incremental: Whether the response should be delivered
+            incrementally, as defined in RFC 9218 section 4.2. If
+            ``None`` or ``False``, no incremental parameter is sent
+            and the peer applies its default (``False``).
+        :type incremental: ``bool`` or ``None``
+        """
+        if not 1 <= stream_id <= self.HIGHEST_ALLOWED_STREAM_ID:
+            msg = f"Invalid prioritized stream ID {stream_id}"
+            raise ProtocolError(msg)
+
+        # RFC 9218 section 6: clients prioritize request streams, servers
+        # prioritize push streams. In both cases the target is a stream
+        # initiated by this peer.
+        if not self._stream_id_is_outbound(stream_id):
+            msg = (
+                f"Stream {stream_id} was not initiated by this peer: "
+                "cannot prioritize it"
+            )
+            raise ProtocolError(msg)
+
+        if urgency is not None and not MIN_URGENCY <= urgency <= MAX_URGENCY:
+            msg = (
+                f"Urgency must be between {MIN_URGENCY} and {MAX_URGENCY}, "
+                f"not {urgency}"
+            )
+            raise ProtocolError(msg)
+
+        self.state_machine.process_input(
+            ConnectionInputs.SEND_PRIORITY_UPDATE,
+        )
+
+        frame = PriorityUpdateFrame(stream_id=0)
+        frame.prioritized_stream_id = stream_id
+        frame.field_value = build_priority_field_value(urgency, incremental)
+
+        self._prepare_for_sending([frame])
+
     def local_flow_control_window(self, stream_id: int) -> int:
         """
         Returns the maximum amount of data that can be sent on stream
@@ -1631,6 +1749,14 @@ class H2Connection:
             stream_events.extend(p_events)
             assert not p_frames
 
+        # If a PRIORITY_UPDATE frame arrived before this stream was opened,
+        # emit the retained update now that the stream exists.
+        pending_priority_update = self._pending_priority_updates.pop(
+            frame.stream_id, None,
+        )
+        if pending_priority_update is not None:
+            stream_events.append(pending_priority_update)
+
         return frames, events + stream_events
 
     def _receive_push_promise_frame(self, frame: PushPromiseFrame) -> tuple[list[Frame], list[Event]]:
@@ -1696,6 +1822,14 @@ class H2Connection:
         )
         self.streams[frame.promised_stream_id] = new_stream
         new_stream.remotely_pushed(pushed_headers)
+
+        # If a PRIORITY_UPDATE frame arrived before this pushed stream was
+        # promised, emit the retained update now that the stream exists.
+        pending_priority_update = self._pending_priority_updates.pop(
+            frame.promised_stream_id, None,
+        )
+        if pending_priority_update is not None:
+            stream_events.append(pending_priority_update)
 
         return frames, events + stream_events
 
@@ -1887,6 +2021,78 @@ class H2Connection:
             msg = f"Stream {frame.stream_id} may not depend on itself"
             raise ProtocolError(msg)
         events.append(event)
+
+        return [], events
+
+    def _receive_priority_update_frame(self, frame: PriorityUpdateFrame) -> tuple[list[Frame], list[Event]]:
+        """
+        Receive a PRIORITY_UPDATE frame on the connection.
+
+        This frame, defined in RFC 9218 section 6, reprioritizes a stream
+        using the extensible prioritization scheme. It is deliberately not
+        translated into the RFC 7540 dependency tree: the parsed parameters
+        are surfaced to the application as a
+        :class:`PriorityUpdateReceived <h2.events.PriorityUpdateReceived>`
+        event, and h2 takes no scheduling action itself.
+        """
+        events = self.state_machine.process_input(
+            ConnectionInputs.RECV_PRIORITY_UPDATE,
+        )
+
+        # RFC 9218 section 6: the frame MUST be sent on stream 0.
+        if frame.stream_id != 0:
+            msg = (
+                "Received PRIORITY_UPDATE frame on non-zero stream "
+                f"{frame.stream_id}"
+            )
+            raise ProtocolError(msg)
+
+        # The payload must at least contain the 4-byte Prioritized Element
+        # ID, and that ID must not be zero.
+        if frame.body_len < 4:
+            msg = "Received PRIORITY_UPDATE frame with too-short payload"
+            raise ProtocolError(msg)
+        prioritized_stream_id = frame.prioritized_stream_id
+        if prioritized_stream_id == 0:
+            msg = "Received PRIORITY_UPDATE frame for stream 0"
+            raise ProtocolError(msg)
+
+        # RFC 9218 section 6: clients prioritize request streams, servers
+        # prioritize push streams. The sender may therefore only prioritize
+        # streams that were initiated by this peer.
+        if self._stream_id_is_outbound(prioritized_stream_id):
+            msg = (
+                "Received PRIORITY_UPDATE frame for stream "
+                f"{prioritized_stream_id}, which the peer may not "
+                "prioritize"
+            )
+            raise ProtocolError(msg)
+
+        urgency, incremental, unknown_parameters = (
+            parse_priority_field_value(frame.field_value)
+        )
+        event = PriorityUpdateReceived(
+            stream_id=prioritized_stream_id,
+            urgency=urgency,
+            incremental=incremental,
+            unknown_parameters=unknown_parameters,
+            field_value=frame.field_value,
+        )
+
+        if prioritized_stream_id in self.streams:
+            # The stream is open: deliver the update immediately.
+            events.append(event)
+        elif prioritized_stream_id <= self.highest_inbound_stream_id:
+            # The stream is already closed (either explicitly or implicitly
+            # by a higher-numbered stream opening first). Deliver the
+            # update, but retain no state for it.
+            events.append(event)
+        else:
+            # The stream has not been opened yet: retain the most recent
+            # update and emit it when the stream opens. The store is
+            # bounded, so a peer cannot exhaust memory by sending updates
+            # for many idle streams.
+            self._pending_priority_updates[prioritized_stream_id] = event
 
         return [], events
 
