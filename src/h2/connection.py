@@ -322,6 +322,24 @@ class H2Connection:
     # Keep in memory limited amount of results for streams closes
     MAX_CLOSED_STREAMS = 2**16
 
+    @classmethod
+    def restore_checkpoint(cls, data: bytes) -> H2Connection:
+        """
+        Restore a connection from a checkpoint produced by
+        :meth:`export_checkpoint`.
+
+        Invalid, unsupported, truncated, or otherwise corrupt checkpoints fail
+        before a usable connection is returned.
+        """
+        if cls is not H2Connection:
+            from .exceptions import CheckpointError  # noqa: PLC0415
+
+            msg = "Checkpoints can only restore concrete H2Connection instances"
+            raise CheckpointError(msg)
+        from .checkpoint import restore_checkpoint  # noqa: PLC0415
+
+        return restore_checkpoint(data)
+
     def __init__(self, config: H2Configuration | None = None) -> None:
         self.state_machine = H2ConnectionStateMachine()
         self.streams: dict[int, H2Stream] = {}
@@ -422,6 +440,25 @@ class H2Connection:
             return
         self._data_to_send += b"".join(f.serialize() for f in frames)
         assert all(f.body_len <= self.max_outbound_frame_size for f in frames)
+
+    def export_checkpoint(self) -> bytes:
+        """
+        Export the connection at the current quiescent byte boundary.
+
+        A quiescent boundary is any point immediately after a call to
+        :meth:`receive_data` has returned (including after feeding zero or
+        more bytes), with no other connection method running. The checkpoint
+        includes unparsed bytes, unfinished HEADERS/CONTINUATION state,
+        pending settings acknowledgements, flow-control balances, HPACK
+        tables, streams, and unread outbound bytes. It never includes a
+        socket or user callbacks.
+
+        Returned application events are not stored and therefore are not
+        replayed after restoration.
+        """
+        from .checkpoint import export_checkpoint  # noqa: PLC0415
+
+        return export_checkpoint(self)
 
     def _open_streams(self, remainder: int) -> int:
         """

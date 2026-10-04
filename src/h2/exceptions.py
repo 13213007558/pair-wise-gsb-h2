@@ -179,6 +179,16 @@ class RFC1122Error(H2Error):
     # turns out to be true, TELL HIM NOTHING.
 
 
+class CheckpointError(H2Error):
+    """
+    A checkpoint was invalid, unsupported, or could not be restored.
+
+    The checkpoint format is explicit and versioned. Raising this error does
+    not mutate an existing connection; restore failures therefore cannot
+    produce a half-usable connection.
+    """
+
+
 class DenialOfServiceError(ProtocolError):
     """
     Emitted when the remote peer exhibits a behaviour that is likely to be an
