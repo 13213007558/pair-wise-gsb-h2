@@ -5,13 +5,12 @@ to talk about general behaviours rather than specific cases.
 """
 from __future__ import annotations
 
-import pytest
-from hypothesis import given
-from hypothesis.strategies import sampled_from
-
 import h2.connection
 import h2.exceptions
 import h2.stream
+import pytest
+from hypothesis import given
+from hypothesis.strategies import sampled_from
 
 
 class TestConnectionStateMachine:
@@ -64,6 +63,56 @@ class TestConnectionStateMachine:
         c.state = state
 
         c.process_input(input_)
+
+    def test_draining_keeps_accepted_stream_frames_allowed(self) -> None:
+        """
+        A draining connection remains usable for the frames of streams that
+        were accepted before the drain began.
+        """
+        c = h2.connection.H2ConnectionStateMachine()
+        c.state = h2.connection.ConnectionState.DRAINING
+
+        for input_ in (
+            h2.connection.ConnectionInputs.SEND_HEADERS,
+            h2.connection.ConnectionInputs.RECV_HEADERS,
+            h2.connection.ConnectionInputs.SEND_DATA,
+            h2.connection.ConnectionInputs.RECV_DATA,
+            h2.connection.ConnectionInputs.SEND_WINDOW_UPDATE,
+            h2.connection.ConnectionInputs.RECV_WINDOW_UPDATE,
+            h2.connection.ConnectionInputs.SEND_RST_STREAM,
+            h2.connection.ConnectionInputs.RECV_RST_STREAM,
+            h2.connection.ConnectionInputs.RECV_PUSH_PROMISE,
+        ):
+            c.process_input(input_)
+            assert c.state is h2.connection.ConnectionState.DRAINING
+
+    def test_drain_complete_transitions_to_closed(self) -> None:
+        """
+        Once the drain finishes the connection state machine moves to closed.
+        """
+        c = h2.connection.H2ConnectionStateMachine()
+        c.state = h2.connection.ConnectionState.DRAINING
+
+        c.process_input(h2.connection.ConnectionInputs.DRAIN_COMPLETE)
+
+        assert c.state is h2.connection.ConnectionState.CLOSED
+
+    def test_send_goaway_starts_draining_from_open_states(self) -> None:
+        """
+        Sending a GOAWAY enters the draining state rather than immediately
+        closing the connection.
+        """
+        for state in (
+            h2.connection.ConnectionState.IDLE,
+            h2.connection.ConnectionState.CLIENT_OPEN,
+            h2.connection.ConnectionState.SERVER_OPEN,
+        ):
+            c = h2.connection.H2ConnectionStateMachine()
+            c.state = state
+
+            c.process_input(h2.connection.ConnectionInputs.SEND_GOAWAY)
+
+            assert c.state is h2.connection.ConnectionState.DRAINING
 
 
 class TestStreamStateMachine:

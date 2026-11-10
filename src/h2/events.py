@@ -564,6 +564,11 @@ class ConnectionTerminated(Event):
     The ConnectionTerminated event is fired when a connection is torn down by
     the remote peer using a GOAWAY frame. Once received, no further action may
     be taken on the connection: a new connection must be established.
+
+    .. versionchanged:: 4.5.0
+       Added the ``remote_terminated`` field, which is ``False`` for events
+       emitted by local forced closures such as
+       :meth:`H2Connection.force_close <h2.connection.H2Connection.force_close>`.
     """
 
     def __init__(self) -> None:
@@ -580,16 +585,80 @@ class ConnectionTerminated(Event):
         #: Additional debug data that can be appended to GOAWAY frame.
         self.additional_data: bytes | None = None
 
+        #: Whether the termination was signalled by the remote peer. This is
+        #: ``True`` for GOAWAY frames received from the peer, and ``False`` for
+        #: the local GOAWAY emitted by a forced closure.
+        self.remote_terminated: bool = True
+
     def __repr__(self) -> str:
         return (
             "<ConnectionTerminated error_code:{!s}, last_stream_id:{}, "
-            "additional_data:{}>".format(
+            "additional_data:{}, remote_terminated:{}>".format(
                 self.error_code,
                 self.last_stream_id,
                 _bytes_representation(
                     self.additional_data[:20]
                     if self.additional_data else None),
+                self.remote_terminated,
             )
+        )
+
+
+@dataclass(**kw_only)
+class DrainCompleted(Event):
+    """
+    The DrainCompleted event is fired when a connection drain initiated with
+    :meth:`H2Connection.drain <h2.connection.H2Connection.drain>` has
+    completed: the GOAWAY frame has been sent and every stream that the peer
+    had accepted before the drain began has ended cleanly.
+
+    No timer is started by h2: the application is responsible for driving any
+    deadline and for calling
+    :meth:`force_close <h2.connection.H2Connection.force_close>` if the drain
+    does not finish in time.
+
+    .. versionadded:: 4.5.0
+    """
+
+    last_stream_id: int
+    """
+    The last stream ID advertised in the GOAWAY frame that began the drain.
+    Streams with higher IDs were never accepted by this endpoint.
+    """
+
+    def __repr__(self) -> str:
+        return f"<DrainCompleted last_stream_id:{self.last_stream_id}>"
+
+
+@dataclass(**kw_only)
+class StreamsNotAccepted(Event):
+    """
+    The StreamsNotAccepted event is fired alongside
+    :class:`ConnectionTerminated <h2.events.ConnectionTerminated>` when a
+    GOAWAY frame is received from the remote peer. It lists the outbound
+    streams that the peer had not accepted (their stream IDs are higher than
+    the GOAWAY ``last_stream_id``).
+
+    h2 never replays the requests made on those streams. The application can
+    inspect the stream IDs and decide whether to retry them on a new
+    connection.
+
+    .. versionadded:: 4.5.0
+    """
+
+    stream_ids: tuple[int, ...]
+    """
+    The IDs of the locally initiated streams that the remote peer did not
+    accept, in ascending order.
+    """
+
+    last_stream_id: int
+    """The ``last_stream_id`` carried by the received GOAWAY frame."""
+
+    def __repr__(self) -> str:
+        return (
+            f"<StreamsNotAccepted last_stream_id:{self.last_stream_id}, "
+            f"stream_ids:{list(self.stream_ids)}>"
         )
 
 

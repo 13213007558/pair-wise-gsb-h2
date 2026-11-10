@@ -337,13 +337,52 @@ class TestEventReprs:
         if sys.version_info >= (3, 11):
             assert repr(e) == (
                 "<ConnectionTerminated error_code:12, "
-                f"last_stream_id:33, additional_data:{data_repr}>"
+                "last_stream_id:33, "
+                f"additional_data:{data_repr}, "
+                "remote_terminated:True>"
             )
         else:
             assert repr(e) == (
                 "<ConnectionTerminated error_code:ErrorCodes.INADEQUATE_SECURITY, "
-                f"last_stream_id:33, additional_data:{data_repr}>"
+                f"last_stream_id:33, additional_data:{data_repr}, "
+                "remote_terminated:True>"
             )
+
+    def test_connectionterminated_local_termination_repr(self) -> None:
+        """
+        A locally forced termination is clearly distinguishable from one
+        signalled by the remote peer.
+        """
+        e = h2.events.ConnectionTerminated()
+        e.error_code = h2.errors.ErrorCodes.INTERNAL_ERROR
+        e.last_stream_id = 7
+        e.remote_terminated = False
+
+        assert repr(e) == (
+            "<ConnectionTerminated error_code:2, last_stream_id:7, "
+            "additional_data:None, remote_terminated:False>"
+        )
+
+    def test_draincompleted_repr(self) -> None:
+        """
+        DrainCompleted has a useful debug representation.
+        """
+        e = h2.events.DrainCompleted(last_stream_id=11)
+
+        assert repr(e) == "<DrainCompleted last_stream_id:11>"
+
+    def test_streamsnotaccepted_repr(self) -> None:
+        """
+        StreamsNotAccepted has a useful debug representation.
+        """
+        e = h2.events.StreamsNotAccepted(
+            stream_ids=(5, 9),
+            last_stream_id=3,
+        )
+
+        assert repr(e) == (
+            "<StreamsNotAccepted last_stream_id:3, stream_ids:[5, 9]>"
+        )
 
     def test_alternativeserviceavailable_repr(self) -> None:
         """

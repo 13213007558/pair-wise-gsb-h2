@@ -11,6 +11,12 @@ dev
 **API Changes (Backward Compatible)**
 
 - Support for Python 3.15 has been added.
+- Added an explicit connection draining API: ``H2Connection.drain()`` emits a
+  graceful GOAWAY and lets accepted streams finish while new requests and
+  pushes are refused with REFUSED_STREAM, and ``H2Connection.force_close()``
+  ends the connection immediately on an application deadline. Added the
+  ``ConnectionState.DRAINING`` state, the ``DrainState`` enum and the
+  ``DrainCompleted`` and ``StreamsNotAccepted`` events.
 
 **Bugfixes**
 

@@ -77,6 +77,12 @@ Events
 .. autoclass:: h2.events.ConnectionTerminated
    :members:
 
+.. autoclass:: h2.events.DrainCompleted
+   :members:
+
+.. autoclass:: h2.events.StreamsNotAccepted
+   :members:
+
 .. autoclass:: h2.events.AlternativeServiceAvailable
    :members:
 

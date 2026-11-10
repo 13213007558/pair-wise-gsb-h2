@@ -323,3 +323,76 @@ a certain number of bytes have been freed up.
 
 For most applications, this method should be preferred to the manual flow
 control mechanism.
+
+Graceful Connection Draining
+----------------------------
+
+.. versionadded:: 4.5.0
+
+When taking a connection out of service a gateway has two distinct needs:
+
+- stop accepting *new* requests immediately;
+- let the requests that have already been accepted finish normally.
+
+:meth:`H2Connection.drain <h2.connection.H2Connection.drain>` models this
+explicitly, separate from the immediate
+:meth:`close_connection <h2.connection.H2Connection.close_connection>` path.
+It emits a GOAWAY frame with ``NO_ERROR`` and moves the connection to
+:class:`ConnectionState.DRAINING <h2.connection.ConnectionState.DRAINING>`.
+
+While draining:
+
+- streams the peer had already accepted keep exchanging DATA, trailers and
+  WINDOW_UPDATE frames exactly as before;
+- new inbound requests whose stream IDs are above the advertised
+  ``last_stream_id`` are refused automatically with a RST_STREAM carrying
+  ``REFUSED_STREAM`` and are never delivered to the application;
+- a PUSH_PROMISE outside the advertised range is refused the same way, so
+  pushes cannot bypass the drain;
+- initiating new outbound streams or pushes locally raises
+  :class:`ProtocolError <h2.exceptions.ProtocolError>`.
+
+GOAWAY frames may be sent more than once, but each subsequent
+``last_stream_id`` may only be *lower* than the previous one. Asking to widen
+the accepted range raises :class:`ProtocolError
+<h2.exceptions.ProtocolError>`.
+
+Drain completion
+~~~~~~~~~~~~~~~~
+
+A drain finishes once every accepted stream has ended. At that point the
+connection moves to :class:`ConnectionState.CLOSED
+<h2.connection.ConnectionState.CLOSED>` and a
+:class:`DrainCompleted <h2.events.DrainCompleted>` event is returned, either
+from the original ``drain()`` call (if no streams were open) or from a later
+:meth:`receive_data <h2.connection.H2Connection.receive_data>` call. The
+coarse lifecycle is also available through the
+:attr:`drain_state <h2.connection.H2Connection.drain_state>` property.
+
+h2 performs no I/O and starts no timers. If the application's deadline
+expires before the drain completes it should call
+:meth:`force_close <h2.connection.H2Connection.force_close>`, which emits a
+GOAWAY with the chosen error code, marks the drain
+:data:`DrainState.ABORTED <h2.connection.DrainState.ABORTED>` and returns a
+local :class:`ConnectionTerminated <h2.events.ConnectionTerminated>` event
+whose ``remote_terminated`` flag is ``False``. A protocol error encountered
+while draining instead marks the connection
+:data:`DrainState.TERMINATED <h2.connection.DrainState.TERMINATED>` and emits
+the usual error GOAWAY.
+
+Receiving a peer GOAWAY
+~~~~~~~~~~~~~~~~~~~~~~~
+
+When the *remote* peer sends a GOAWAY, h2 fires
+:class:`ConnectionTerminated <h2.events.ConnectionTerminated>` as usual and,
+if some locally initiated streams were not accepted, a
+:class:`StreamsNotAccepted <h2.events.StreamsNotAccepted>` event listing their
+stream IDs. The same information is available from
+:attr:`unaccepted_outbound_streams
+<h2.connection.H2Connection.unaccepted_outbound_streams>`. h2 never replays
+those requests: the application decides whether and how to retry them on a
+new connection. If a remote GOAWAY arrives while a local drain is in progress
+the drain continues until the accepted streams finish.
+
+A complete, socket-free demonstration lives at
+``examples/draining.py`` in the repository.

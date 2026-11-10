@@ -34,6 +34,7 @@ from .errors import ErrorCodes, _error_code_from_int
 from .events import (
     AlternativeServiceAvailable,
     ConnectionTerminated,
+    DrainCompleted,
     Event,
     InformationalResponseReceived,
     PingAckReceived,
@@ -43,6 +44,7 @@ from .events import (
     RequestReceived,
     ResponseReceived,
     SettingsAcknowledged,
+    StreamsNotAccepted,
     TrailersReceived,
     UnknownFrameReceived,
     WindowUpdated,
@@ -78,6 +80,38 @@ class ConnectionState(Enum):
     CLIENT_OPEN = 1
     SERVER_OPEN = 2
     CLOSED = 3
+    DRAINING = 4
+
+
+class DrainState(Enum):
+    """
+    The lifecycle state of a connection drain.
+
+    This is intentionally separate from
+    :class:`ConnectionState`: a draining connection still allows the accepted
+    streams to exchange frames, even though the connection itself is no longer
+    accepting new work.
+
+    .. versionadded:: 4.5.0
+    """
+
+    #: No drain is in progress and the connection is usable normally.
+    IDLE = 0
+
+    #: A GOAWAY was sent locally and accepted streams are being allowed to
+    #: finish. New inbound requests and pushes are refused.
+    DRAINING = 1
+
+    #: The drain completed cleanly: all accepted streams have ended.
+    DRAINED = 2
+
+    #: The drain was aborted by a local forced closure (for example an
+    #: application-level deadline via ``force_close``).
+    ABORTED = 3
+
+    #: The connection was terminated by a protocol error while a drain was in
+    #: progress.
+    TERMINATED = 4
 
 
 class ConnectionInputs(Enum):
@@ -101,6 +135,7 @@ class ConnectionInputs(Enum):
     RECV_PRIORITY = 17
     SEND_ALTERNATIVE_SERVICE = 18  # Added in 2.3.0
     RECV_ALTERNATIVE_SERVICE = 19  # Added in 2.3.0
+    DRAIN_COMPLETE = 20  # Added in 4.5.0
 
 
 class AllowedStreamIDs(IntEnum):
@@ -147,7 +182,7 @@ class H2ConnectionStateMachine:
         (ConnectionState.IDLE, ConnectionInputs.RECV_PING):
             (None, ConnectionState.IDLE),
         (ConnectionState.IDLE, ConnectionInputs.SEND_GOAWAY):
-            (None, ConnectionState.CLOSED),
+            (None, ConnectionState.DRAINING),
         (ConnectionState.IDLE, ConnectionInputs.RECV_GOAWAY):
             (None, ConnectionState.CLOSED),
         (ConnectionState.IDLE, ConnectionInputs.SEND_PRIORITY):
@@ -165,7 +200,7 @@ class H2ConnectionStateMachine:
         (ConnectionState.CLIENT_OPEN, ConnectionInputs.SEND_DATA):
             (None, ConnectionState.CLIENT_OPEN),
         (ConnectionState.CLIENT_OPEN, ConnectionInputs.SEND_GOAWAY):
-            (None, ConnectionState.CLOSED),
+            (None, ConnectionState.DRAINING),
         (ConnectionState.CLIENT_OPEN, ConnectionInputs.SEND_WINDOW_UPDATE):
             (None, ConnectionState.CLIENT_OPEN),
         (ConnectionState.CLIENT_OPEN, ConnectionInputs.SEND_PING):
@@ -206,7 +241,7 @@ class H2ConnectionStateMachine:
         (ConnectionState.SERVER_OPEN, ConnectionInputs.SEND_DATA):
             (None, ConnectionState.SERVER_OPEN),
         (ConnectionState.SERVER_OPEN, ConnectionInputs.SEND_GOAWAY):
-            (None, ConnectionState.CLOSED),
+            (None, ConnectionState.DRAINING),
         (ConnectionState.SERVER_OPEN, ConnectionInputs.SEND_WINDOW_UPDATE):
             (None, ConnectionState.SERVER_OPEN),
         (ConnectionState.SERVER_OPEN, ConnectionInputs.SEND_PING):
@@ -239,6 +274,54 @@ class H2ConnectionStateMachine:
         (ConnectionState.SERVER_OPEN,
             ConnectionInputs.RECV_ALTERNATIVE_SERVICE):
                 (None, ConnectionState.SERVER_OPEN),
+
+        # State: draining.
+        #
+        # A local GOAWAY has been emitted. Frames on streams the peer had
+        # accepted before the drain began continue to be processed, but new
+        # inbound requests and pushes are refused at the connection level
+        # before they ever reach the application.
+        (ConnectionState.DRAINING, ConnectionInputs.SEND_HEADERS):
+            (None, ConnectionState.DRAINING),
+        (ConnectionState.DRAINING, ConnectionInputs.SEND_DATA):
+            (None, ConnectionState.DRAINING),
+        (ConnectionState.DRAINING, ConnectionInputs.SEND_GOAWAY):
+            (None, ConnectionState.DRAINING),
+        (ConnectionState.DRAINING, ConnectionInputs.RECV_GOAWAY):
+            (None, ConnectionState.DRAINING),
+        (ConnectionState.DRAINING, ConnectionInputs.SEND_WINDOW_UPDATE):
+            (None, ConnectionState.DRAINING),
+        (ConnectionState.DRAINING, ConnectionInputs.RECV_WINDOW_UPDATE):
+            (None, ConnectionState.DRAINING),
+        (ConnectionState.DRAINING, ConnectionInputs.SEND_PING):
+            (None, ConnectionState.DRAINING),
+        (ConnectionState.DRAINING, ConnectionInputs.RECV_PING):
+            (None, ConnectionState.DRAINING),
+        (ConnectionState.DRAINING, ConnectionInputs.SEND_SETTINGS):
+            (None, ConnectionState.DRAINING),
+        (ConnectionState.DRAINING, ConnectionInputs.RECV_SETTINGS):
+            (None, ConnectionState.DRAINING),
+        (ConnectionState.DRAINING, ConnectionInputs.SEND_RST_STREAM):
+            (None, ConnectionState.DRAINING),
+        (ConnectionState.DRAINING, ConnectionInputs.RECV_RST_STREAM):
+            (None, ConnectionState.DRAINING),
+        (ConnectionState.DRAINING, ConnectionInputs.SEND_PRIORITY):
+            (None, ConnectionState.DRAINING),
+        (ConnectionState.DRAINING, ConnectionInputs.RECV_PRIORITY):
+            (None, ConnectionState.DRAINING),
+        (ConnectionState.DRAINING, ConnectionInputs.RECV_HEADERS):
+            (None, ConnectionState.DRAINING),
+        (ConnectionState.DRAINING, ConnectionInputs.RECV_DATA):
+            (None, ConnectionState.DRAINING),
+        (ConnectionState.DRAINING, ConnectionInputs.RECV_PUSH_PROMISE):
+            (None, ConnectionState.DRAINING),
+        (ConnectionState.DRAINING, ConnectionInputs.RECV_ALTERNATIVE_SERVICE):
+            (None, ConnectionState.DRAINING),
+        (ConnectionState.DRAINING,
+            ConnectionInputs.SEND_ALTERNATIVE_SERVICE):
+                (None, ConnectionState.DRAINING),
+        (ConnectionState.DRAINING, ConnectionInputs.DRAIN_COMPLETE):
+            (None, ConnectionState.CLOSED),
 
         # State: closed
         (ConnectionState.CLOSED, ConnectionInputs.SEND_GOAWAY):
@@ -396,6 +479,14 @@ class H2Connection:
             size_limit=self.MAX_CLOSED_STREAMS,
         )
 
+        # Graceful drain state. ``_drain_state`` distinguishes a graceful drain
+        # (GOAWAY followed by letting accepted streams finish) from an immediate
+        # connection close. The two GOAWAY last-stream-ID fields track the
+        # strongest (lowest) value advertised locally or received from the peer.
+        self._drain_state = DrainState.IDLE
+        self._local_goaway_last_stream_id: int | None = None
+        self._remote_goaway_last_stream_id: int | None = None
+
         # The flow control window manager for the connection.
         self._inbound_flow_control_window_manager = WindowManager(
             max_window_size=self.local_settings.initial_window_size,
@@ -459,6 +550,79 @@ class H2Connection:
         """
         inbound_numbers = int(not self.config.client_side)
         return self._open_streams(inbound_numbers)
+
+    @property
+    def drain_state(self) -> DrainState:
+        """
+        The current :class:`DrainState` of the connection. A connection that
+        has never been drained reports :data:`DrainState.IDLE
+        <h2.connection.DrainState.IDLE>`.
+
+        .. versionadded:: 4.5.0
+        """
+        return self._drain_state
+
+    @property
+    def draining(self) -> bool:
+        """
+        Whether a local drain (initiated with
+        :meth:`drain <h2.connection.H2Connection.drain>`) is currently in
+        progress. While draining, new inbound requests and pushes are refused
+        but already accepted streams continue to be processed.
+
+        .. versionadded:: 4.5.0
+        """
+        return self._drain_state is DrainState.DRAINING
+
+    @property
+    def local_goaway_last_stream_id(self) -> int | None:
+        """
+        The lowest ``last_stream_id`` advertised in a GOAWAY frame sent by this
+        endpoint, or ``None`` if no GOAWAY has been sent. Repeated GOAWAY
+        frames can only tighten this value.
+
+        .. versionadded:: 4.5.0
+        """
+        return self._local_goaway_last_stream_id
+
+    @property
+    def remote_goaway_last_stream_id(self) -> int | None:
+        """
+        The lowest ``last_stream_id`` received in a GOAWAY frame from the
+        remote peer, or ``None`` if no GOAWAY has been received.
+
+        .. versionadded:: 4.5.0
+        """
+        return self._remote_goaway_last_stream_id
+
+    @property
+    def unaccepted_outbound_streams(self) -> tuple[int, ...]:
+        """
+        The IDs of locally initiated streams that the remote peer has not
+        accepted. If no GOAWAY has been received this is empty: nothing is
+        known to have been refused. Otherwise it contains the open outbound
+        streams whose IDs are higher than the strongest GOAWAY
+        ``last_stream_id`` advertised by the peer.
+
+        h2 does not replay the requests made on these streams. The application
+        may retry them on a new connection.
+
+        .. versionadded:: 4.5.0
+        """
+        last_stream_id = self._remote_goaway_last_stream_id
+        if last_stream_id is None:
+            return ()
+
+        outbound = int(self.config.client_side)
+        return tuple(
+            sorted(
+                stream_id
+                for stream_id, stream in self.streams.items()
+                if stream.open
+                and (stream_id % 2 == outbound)
+                and stream_id > last_stream_id
+            ),
+        )
 
     @property
     def inbound_flow_control_window(self) -> int:
@@ -794,6 +958,12 @@ class H2Connection:
 
         # Check we can open the stream.
         if stream_id not in self.streams:
+            if self.draining:
+                msg = (
+                    "Cannot initiate new streams while the connection is "
+                    "draining."
+                )
+                raise ProtocolError(msg)
             max_open_streams = self.remote_settings.max_concurrent_streams
             value = self.open_outbound_streams # take a copy due to the property accessor having side affects
             if (value + 1) > max_open_streams:
@@ -834,6 +1004,9 @@ class H2Connection:
             )
 
         self._prepare_for_sending(frames)
+
+        if end_stream:
+            self._maybe_complete_drain()
 
     def send_data(self,
                   stream_id: int,
@@ -911,6 +1084,9 @@ class H2Connection:
         )
         assert self.outbound_flow_control_window >= 0 or frame_size == 0
 
+        if end_stream:
+            self._maybe_complete_drain()
+
     def end_stream(self, stream_id: int) -> None:
         """
         Cleanly end a given stream.
@@ -930,6 +1106,7 @@ class H2Connection:
         self.state_machine.process_input(ConnectionInputs.SEND_DATA)
         frames = self._get_stream_by_id(stream_id).end_stream()
         self._prepare_for_sending(frames)
+        self._maybe_complete_drain()
 
     def increment_flow_control_window(self, increment: int, stream_id: int | None = None) -> None:
         """
@@ -1010,6 +1187,10 @@ class H2Connection:
             msg = "Remote peer has disabled stream push"
             raise ProtocolError(msg)
 
+        if self.draining:
+            msg = "Cannot push new streams while the connection is draining."
+            raise ProtocolError(msg)
+
         self.state_machine.process_input(ConnectionInputs.SEND_PUSH_PROMISE)
         stream = self._get_stream_by_id(stream_id)
 
@@ -1074,13 +1255,20 @@ class H2Connection:
         stream = self._get_stream_by_id(stream_id)
         frames = stream.reset_stream(error_code)
         self._prepare_for_sending(frames)
+        self._maybe_complete_drain()
 
     def close_connection(self,
                          error_code: ErrorCodes | int = 0,
                          additional_data: bytes | None = None,
                          last_stream_id: int | None = None) -> None:
         """
-        Close a connection, emitting a GOAWAY frame.
+        Close a connection immediately, emitting a GOAWAY frame.
+
+        This is an *immediate* close: it does not wait for in-flight streams to
+        finish. To gracefully stop accepting new requests while letting the
+        streams that were already accepted complete, use
+        :meth:`drain <h2.connection.H2Connection.drain>` instead. Calling this
+        method while a drain is in progress aborts that drain.
 
         .. versionchanged:: 2.4.0
            Added ``additional_data`` and ``last_stream_id`` arguments.
@@ -1094,7 +1282,9 @@ class H2Connection:
         :returns: Nothing
         """
         self.config.logger.debug("Close connection")
-        self.state_machine.process_input(ConnectionInputs.SEND_GOAWAY)
+
+        if self.draining:
+            self._drain_state = DrainState.ABORTED
 
         # Additional_data must be bytes
         if additional_data is not None:
@@ -1103,13 +1293,197 @@ class H2Connection:
         if last_stream_id is None:
             last_stream_id = self.highest_inbound_stream_id
 
-        f = GoAwayFrame(
-            stream_id=0,
+        self._emit_goaway(
             last_stream_id=last_stream_id,
             error_code=error_code,
             additional_data=(additional_data or b""),
         )
-        self._prepare_for_sending([f])
+        self.state_machine.state = ConnectionState.CLOSED
+
+    def drain(self,
+              last_stream_id: int | None = None,
+              additional_data: bytes | None = None) -> list[Event]:
+        """
+        Begin gracefully draining the connection.
+
+        A GOAWAY frame with error code :data:`ErrorCodes.NO_ERROR
+        <h2.errors.ErrorCodes.NO_ERROR>` is emitted and the connection moves to
+        :data:`ConnectionState.DRAINING
+        <h2.connection.ConnectionState.DRAINING>`. Streams that the peer had
+        already accepted continue to exchange DATA, trailers and window
+        updates normally. New inbound requests and PUSH_PROMISE frames outside
+        the advertised range are refused with a RST_STREAM frame carrying
+        :data:`ErrorCodes.REFUSED_STREAM
+        <h2.errors.ErrorCodes.REFUSED_STREAM>` and are never delivered to the
+        application.
+
+        Repeated calls are allowed but may only tighten the advertised
+        ``last_stream_id``: asking to widen the accepted range raises
+        :class:`ProtocolError <h2.exceptions.ProtocolError>`.
+
+        h2 starts no timers: if the drain does not finish before the
+        application's deadline, the application should call
+        :meth:`force_close <h2.connection.H2Connection.force_close>`.
+
+        The returned list contains a
+        :class:`DrainCompleted <h2.events.DrainCompleted>` event if the drain
+        is already finished (there were no accepted streams left open). It is
+        otherwise empty and the completion event is returned later from
+        :meth:`receive_data <h2.connection.H2Connection.receive_data>`.
+
+        .. versionadded:: 4.5.0
+
+        :param last_stream_id: (optional) The last stream accepted from the
+            peer. Defaults to ``highest_inbound_stream_id``.
+        :param additional_data: (optional) Additional debug data appended to
+            the GOAWAY frame. Must be a bytestring.
+        :raises ProtocolError: If the connection is already closed, a drain has
+            already completed, or the requested ``last_stream_id`` would widen
+            an already advertised range.
+        :returns: A list of lifecycle events, possibly containing
+            :class:`DrainCompleted <h2.events.DrainCompleted>`.
+        """
+        self.config.logger.debug("Draining connection")
+
+        if self.state_machine.state is ConnectionState.CLOSED:
+            msg = "Cannot drain a closed connection."
+            raise ProtocolError(msg)
+
+        if additional_data is not None:
+            assert isinstance(additional_data, bytes)
+
+        if last_stream_id is None:
+            last_stream_id = self.highest_inbound_stream_id
+
+        current_limit = self._local_goaway_last_stream_id
+        if current_limit is not None and last_stream_id > current_limit:
+            msg = (
+                f"Cannot widen GOAWAY last_stream_id from {current_limit} "
+                f"to {last_stream_id}"
+            )
+            raise ProtocolError(msg)
+
+        self._drain_state = DrainState.DRAINING
+        self._emit_goaway(
+            last_stream_id=last_stream_id,
+            error_code=ErrorCodes.NO_ERROR,
+            additional_data=(additional_data or b""),
+        )
+        return self._maybe_complete_drain()
+
+    def force_close(self,
+                    error_code: ErrorCodes | int = ErrorCodes.INTERNAL_ERROR,
+                    additional_data: bytes | None = None,
+                    last_stream_id: int | None = None) -> list[Event]:
+        """
+        Forcibly end the connection, for example because an application-level
+        drain deadline expired.
+
+        This emits a GOAWAY frame carrying ``error_code`` and immediately
+        moves the connection to :data:`ConnectionState.CLOSED
+        <h2.connection.ConnectionState.CLOSED>`. If a drain was in progress it
+        is marked :data:`DrainState.ABORTED <h2.connection.DrainState.ABORTED>`;
+        the accepted streams are not given any further chance to finish.
+
+        The returned list contains a
+        :class:`ConnectionTerminated <h2.events.ConnectionTerminated>` event
+        with ``remote_terminated`` set to ``False`` describing the local
+        termination.
+
+        .. versionadded:: 4.5.0
+
+        :param error_code: (optional) The error code to send in the GOAWAY
+            frame. Defaults to :data:`ErrorCodes.INTERNAL_ERROR
+            <h2.errors.ErrorCodes.INTERNAL_ERROR>`.
+        :param additional_data: (optional) Additional debug data appended to
+            the GOAWAY frame. Must be a bytestring.
+        :param last_stream_id: (optional) The last stream accepted from the
+            peer. Defaults to ``highest_inbound_stream_id``.
+        :raises ProtocolError: If the connection has already been closed.
+        :returns: A list containing a local
+            :class:`ConnectionTerminated <h2.events.ConnectionTerminated>`
+            event.
+        """
+        self.config.logger.debug("Force closing connection")
+
+        if self.state_machine.state is ConnectionState.CLOSED:
+            msg = "Cannot force close a closed connection."
+            raise ProtocolError(msg)
+
+        if additional_data is not None:
+            assert isinstance(additional_data, bytes)
+
+        if last_stream_id is None:
+            last_stream_id = self.highest_inbound_stream_id
+
+        if self.draining:
+            self._drain_state = DrainState.ABORTED
+
+        self._emit_goaway(
+            last_stream_id=last_stream_id,
+            error_code=error_code,
+            additional_data=(additional_data or b""),
+        )
+        self.state_machine.state = ConnectionState.CLOSED
+
+        event = ConnectionTerminated()
+        event.error_code = _error_code_from_int(int(error_code))
+        event.last_stream_id = last_stream_id
+        event.additional_data = additional_data or None
+        event.remote_terminated = False
+        return [event]
+
+    def _emit_goaway(self,
+                     last_stream_id: int,
+                     error_code: ErrorCodes | int,
+                     additional_data: bytes) -> None:
+        """
+        Serialize a GOAWAY frame and update the local GOAWAY bookkeeping.
+        """
+        self.state_machine.process_input(ConnectionInputs.SEND_GOAWAY)
+        self._local_goaway_last_stream_id = (
+            last_stream_id
+            if self._local_goaway_last_stream_id is None
+            else min(self._local_goaway_last_stream_id, last_stream_id)
+        )
+        frame = GoAwayFrame(
+            stream_id=0,
+            last_stream_id=last_stream_id,
+            error_code=error_code,
+            additional_data=additional_data,
+        )
+        self._prepare_for_sending([frame])
+
+    def _accepted_open_streams(self) -> dict[int, H2Stream]:
+        """
+        The still-open streams that the peer had accepted before the local
+        drain began.
+        """
+        limit = self._local_goaway_last_stream_id
+        if limit is None:
+            return dict(self.streams)
+        return {
+            stream_id: stream
+            for stream_id, stream in self.streams.items()
+            if stream.open and stream_id <= limit
+        }
+
+    def _maybe_complete_drain(self) -> list[Event]:
+        """
+        Move the connection out of the draining state once every accepted
+        stream has finished, returning the DrainCompleted event.
+        """
+        if not self.draining or self._accepted_open_streams():
+            return []
+
+        last_stream_id = (
+            self._local_goaway_last_stream_id
+            if self._local_goaway_last_stream_id is not None
+            else self.highest_inbound_stream_id
+        )
+        self._drain_state = DrainState.DRAINED
+        self.state_machine.process_input(ConnectionInputs.DRAIN_COMPLETE)
+        return [DrainCompleted(last_stream_id=last_stream_id)]
 
     def update_settings(self, new_settings: dict[SettingCodes | int, int]) -> None:
         """
@@ -1530,6 +1904,7 @@ class H2Connection:
             self._terminate_connection(e.error_code)
             raise
 
+        events.extend(self._maybe_complete_drain())
         return events
 
     def _receive_frame(self, frame: Frame) -> list[Event]:
@@ -1586,16 +1961,32 @@ class H2Connection:
         Terminate the connection early. Used in error handling blocks to send
         GOAWAY frames.
         """
+        if self.draining:
+            self._drain_state = DrainState.TERMINATED
         f = GoAwayFrame(0)
         f.last_stream_id = self.highest_inbound_stream_id
         f.error_code = error_code
         self.state_machine.process_input(ConnectionInputs.SEND_GOAWAY)
+        self._local_goaway_last_stream_id = (
+            f.last_stream_id
+            if self._local_goaway_last_stream_id is None
+            else min(self._local_goaway_last_stream_id, f.last_stream_id)
+        )
+        self.state_machine.state = ConnectionState.CLOSED
         self._prepare_for_sending([f])
 
     def _receive_headers_frame(self, frame: HeadersFrame) -> tuple[list[Frame], list[Event]]:
         """
         Receive a headers frame on the connection.
         """
+        # While draining, requests for streams beyond the range we advertised
+        # in our GOAWAY must never reach the application. Refuse them with a
+        # RST_STREAM instead of creating stream state or firing an event.
+        if self.draining and frame.stream_id not in self.streams:
+            refusal = self._refuse_unaccepted_stream(frame.stream_id)
+            if refusal is not None:
+                return refusal
+
         # If necessary, check we can open the stream. Also validate that the
         # stream ID is valid.
         if frame.stream_id not in self.streams:
@@ -1633,6 +2024,27 @@ class H2Connection:
 
         return frames, events + stream_events
 
+    def _refuse_unaccepted_stream(self, stream_id: int) -> tuple[list[Frame], list[Event]] | None:
+        """
+        Refuse a stream the peer initiated after we began draining.
+
+        Streams with an ID above the last stream ID advertised in our local
+        GOAWAY have not been accepted: reset them with REFUSED_STREAM without
+        involving the application. Returns ``None`` for streams that fall
+        inside the accepted range, so that normal processing takes over.
+        """
+        last_stream_id = self._local_goaway_last_stream_id
+        if last_stream_id is None or stream_id <= last_stream_id:
+            return None
+
+        f = RstStreamFrame(stream_id)
+        f.error_code = ErrorCodes.REFUSED_STREAM
+        self.config.logger.debug(
+            "Refusing stream %d received while draining (limit %d)",
+            stream_id, last_stream_id,
+        )
+        return [f], []
+
     def _receive_push_promise_frame(self, frame: PushPromiseFrame) -> tuple[list[Frame], list[Event]]:
         """
         Receive a push-promise frame on the connection.
@@ -1640,6 +2052,12 @@ class H2Connection:
         if not self.local_settings.enable_push:
             msg = "Received pushed stream"
             raise ProtocolError(msg)
+
+        refusal = self._refuse_unaccepted_stream(frame.promised_stream_id)
+        if refusal is not None:
+            # PUSH_PROMISE cannot be used to sneak work past a draining
+            # connection: reset the promised stream without creating it.
+            return refusal
 
         pushed_headers = _decode_headers(self.decoder, frame.data)
 
@@ -1746,6 +2164,20 @@ class H2Connection:
             flow_controlled_length,
         )
 
+        # DATA on a stream we never accepted (the peer opened it after we sent
+        # a GOAWAY) still consumes connection flow control window. Account for
+        # the data and reset it with REFUSED_STREAM without involving the
+        # application. Accepted-but-cleaned-up streams keep their original
+        # error handling below.
+        if (self.draining
+                and frame.stream_id not in self.streams
+                and frame.stream_id not in self._closed_streams):
+            return self._handle_data_on_closed_stream(
+                events,
+                self._build_refused_stream_error(frame.stream_id),
+                frame,
+            )
+
         try:
             stream = self._get_stream_by_id(frame.stream_id)
             frames, stream_events = stream.receive_data(
@@ -1759,6 +2191,15 @@ class H2Connection:
             return self._handle_data_on_closed_stream(events, e, frame)
 
         return frames, events + stream_events
+
+    def _build_refused_stream_error(self, stream_id: int) -> StreamClosedError:
+        """
+        Build the StreamClosedError used when resetting a stream that was
+        refused during a drain, carrying the REFUSED_STREAM error code.
+        """
+        error = StreamClosedError(stream_id)
+        error.error_code = ErrorCodes.REFUSED_STREAM
+        return error
 
     def _receive_settings_frame(self, frame: SettingsFrame) -> tuple[list[Frame], list[Event]]:
         """
@@ -1894,12 +2335,25 @@ class H2Connection:
         """
         Receive a GOAWAY frame on the connection.
         """
+        # If we are draining ourselves, a GOAWAY from the peer does not end
+        # the drain: accepted streams must still be allowed to finish. The
+        # state machine keeps a draining connection in DRAINING in that case.
         events = self.state_machine.process_input(
             ConnectionInputs.RECV_GOAWAY,
         )
 
-        # Clear the outbound data buffer: we cannot send further data now.
+        # Clear the outbound data buffer: we cannot send further data now on
+        # any stream the peer did not accept.
         self.clear_outbound_data_buffer()
+
+        # GOAWAY notifications can only tighten the accepted range, so track
+        # the lowest last_stream_id seen from the peer.
+        previous_limit = self._remote_goaway_last_stream_id
+        self._remote_goaway_last_stream_id = (
+            frame.last_stream_id
+            if previous_limit is None
+            else min(previous_limit, frame.last_stream_id)
+        )
 
         # Fire an appropriate ConnectionTerminated event.
         new_event = ConnectionTerminated()
@@ -1907,6 +2361,15 @@ class H2Connection:
         new_event.last_stream_id = frame.last_stream_id
         new_event.additional_data = frame.additional_data or None
         events.append(new_event)
+
+        not_accepted = self.unaccepted_outbound_streams
+        if not_accepted:
+            events.append(
+                StreamsNotAccepted(
+                    stream_ids=not_accepted,
+                    last_stream_id=frame.last_stream_id,
+                ),
+            )
 
         return [], events
 
