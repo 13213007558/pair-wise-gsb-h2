@@ -377,7 +377,12 @@ class H2Connection:
         self.max_inbound_frame_size = self.local_settings.max_frame_size
 
         # Buffer for incoming data.
-        self.incoming_buffer = FrameBuffer(server=not self.config.client_side)
+        self.incoming_buffer = FrameBuffer(
+            server=not self.config.client_side,
+            max_encoded_header_block_size=(
+                self.config.max_encoded_header_block_size
+            ),
+        )
 
         # A private variable to store a sequence of received header frames
         # until completion.
@@ -1514,6 +1519,12 @@ class H2Connection:
         events: list[Event] = []
         self.incoming_buffer.add_data(data)
         self.incoming_buffer.max_frame_size = self.max_inbound_frame_size
+        # Propagate the configured cap. The frame buffer freezes it at the
+        # start of each header block, so a change here never applies halfway
+        # through an in-progress block.
+        self.incoming_buffer.max_encoded_header_block_size = (
+            self.config.max_encoded_header_block_size
+        )
 
         try:
             for frame in self.incoming_buffer:

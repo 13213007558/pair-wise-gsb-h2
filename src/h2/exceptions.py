@@ -44,6 +44,66 @@ class FrameDataMissingError(ProtocolError):
     error_code = ErrorCodes.FRAME_SIZE_ERROR
 
 
+class HeaderBlockTooLargeError(ProtocolError):
+    """
+    The remote peer sent an HPACK-encoded header block whose size, measured
+    before decompression and excluding non-HPACK bytes such as padding or
+    priority data, exceeded the configured
+    ``max_encoded_header_block_size`` limit.
+
+    No partial header event is delivered: the in-progress header block is
+    discarded and the connection is terminated.
+
+    .. versionadded:: 4.5.0
+    """
+
+    #: The error code corresponds to this kind of Protocol Error.
+    error_code = ErrorCodes.PROTOCOL_ERROR
+
+    def __init__(self, stream_id: int, encoded_size: int, max_size: int) -> None:
+        #: The ID of the stream whose header block exceeded the limit.
+        self.stream_id = stream_id
+
+        #: The encoded size, in bytes, accumulated when the limit was hit.
+        self.encoded_size = encoded_size
+
+        #: The configured limit, in bytes.
+        self.max_size = max_size
+        super().__init__(
+            f"Encoded header block of {encoded_size} bytes on stream "
+            f"{stream_id} exceeds limit of {max_size} bytes",
+        )
+
+
+class TooManyContinuationFramesError(ProtocolError):
+    """
+    The remote peer sent more CONTINUATION frames for a single header block
+    than the implementation is prepared to buffer.
+
+    No partial header event is delivered: the in-progress header block is
+    discarded and the connection is terminated.
+
+    .. versionadded:: 4.5.0
+    """
+
+    #: The error code corresponds to this kind of Protocol Error.
+    error_code = ErrorCodes.PROTOCOL_ERROR
+
+    def __init__(self, stream_id: int, frame_count: int, max_frames: int) -> None:
+        #: The ID of the stream whose header block had too many frames.
+        self.stream_id = stream_id
+
+        #: The number of header-bearing frames accumulated when rejected.
+        self.frame_count = frame_count
+
+        #: The maximum number of header-bearing frames permitted per block.
+        self.max_frames = max_frames
+        super().__init__(
+            f"Header block on stream {stream_id} used {frame_count} frames, "
+            f"exceeding the limit of {max_frames} frames",
+        )
+
+
 class TooManyStreamsError(ProtocolError):
     """
     An attempt was made to open a stream that would lead to too many concurrent

@@ -30,6 +30,30 @@ class _BooleanConfigOption:
         setattr(instance, self.attr_name, value)
 
 
+class _PositiveIntConfigOption:
+    """
+    Descriptor for handling a config option that must hold a non-negative
+    integer. ``bool`` is rejected explicitly so that ``True`` does not silently
+    become ``1``.
+    """
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.attr_name = f"_{self.name}"
+
+    def __get__(self, instance: Any, owner: Any) -> int:
+        return getattr(instance, self.attr_name)  # type: ignore
+
+    def __set__(self, instance: Any, value: int) -> None:
+        if isinstance(value, bool) or not isinstance(value, int):
+            msg = f"{self.name} must be an integer"
+            raise ValueError(msg)  # noqa: TRY004
+        if value < 0:
+            msg = f"{self.name} must be non-negative"
+            raise ValueError(msg)
+        setattr(instance, self.attr_name, value)
+
+
 class DummyLogger:
     """
     A Logger object that does not actual logging, hence a DummyLogger.
@@ -149,7 +173,27 @@ class H2Configuration:
         .. versionadded:: 2.6.0
 
     :type logger: ``logging.Logger``
+
+    :param max_encoded_header_block_size: The maximum total number of
+        HPACK-encoded bytes, measured before decompression, that a single
+        received header block is allowed to occupy. The count covers the
+        header block fragment of the opening HEADERS or PUSH_PROMISE frame
+        plus every CONTINUATION frame belonging to the block, but excludes
+        padding, the padding length field, the PUSH_PROMISE promised stream
+        ID, and HEADERS priority data. A value of ``0`` disables the limit.
+        Defaults to ``65536``.
+
+        The limit is fixed for the duration of each header block: changing
+        this attribute only affects header blocks that start afterwards, so a
+        block in progress is never checked against two different limits.
+
+        .. versionadded:: 4.5.0
+
+    :type max_encoded_header_block_size: ``int``
     """
+
+    #: The default cap on the encoded size of a single received header block.
+    DEFAULT_MAX_ENCODED_HEADER_BLOCK_SIZE = 2**16
 
     client_side = _BooleanConfigOption("client_side")
     validate_outbound_headers = _BooleanConfigOption(
@@ -167,6 +211,9 @@ class H2Configuration:
     normalize_inbound_headers = _BooleanConfigOption(
         "normalize_inbound_headers",
     )
+    max_encoded_header_block_size = _PositiveIntConfigOption(
+        "max_encoded_header_block_size",
+    )
 
     def __init__(self,
                  client_side: bool = True,
@@ -176,7 +223,8 @@ class H2Configuration:
                  split_outbound_cookies: bool = False,
                  validate_inbound_headers: bool = True,
                  normalize_inbound_headers: bool = True,
-                 logger: DummyLogger | OutputLogger | None = None) -> None:
+                 logger: DummyLogger | OutputLogger | None = None,
+                 max_encoded_header_block_size: int = DEFAULT_MAX_ENCODED_HEADER_BLOCK_SIZE) -> None:
         self.client_side = client_side
         self.header_encoding = header_encoding
         self.validate_outbound_headers = validate_outbound_headers
@@ -185,6 +233,7 @@ class H2Configuration:
         self.validate_inbound_headers = validate_inbound_headers
         self.normalize_inbound_headers = normalize_inbound_headers
         self.logger = logger or DummyLogger(__name__)
+        self.max_encoded_header_block_size = max_encoded_header_block_size
 
     @property
     def header_encoding(self) -> bool | str | None:

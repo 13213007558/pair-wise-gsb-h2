@@ -118,6 +118,14 @@ Protocol Errors
    :show-inheritance:
    :members:
 
+.. autoclass:: h2.exceptions.HeaderBlockTooLargeError
+   :show-inheritance:
+   :members:
+
+.. autoclass:: h2.exceptions.TooManyContinuationFramesError
+   :show-inheritance:
+   :members:
+
 .. autoclass:: h2.exceptions.TooManyStreamsError
    :show-inheritance:
    :members:

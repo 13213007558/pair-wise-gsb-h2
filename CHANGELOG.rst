@@ -11,6 +11,16 @@ dev
 **API Changes (Backward Compatible)**
 
 - Support for Python 3.15 has been added.
+- Added the ``max_encoded_header_block_size`` option to ``H2Configuration``
+  (defaulting to 65536 bytes, ``0`` disables it). It caps the total HPACK-
+  encoded size of a received header block before decompression, counting the
+  opening HEADERS/PUSH_PROMISE fragment plus all CONTINUATION frames while
+  excluding padding, priority data and the promised stream ID. Oversized
+  blocks raise ``HeaderBlockTooLargeError``; an excessive number of
+  CONTINUATION frames now raises the more specific
+  ``TooManyContinuationFramesError`` (both remain ``ProtocolError``
+  subclasses). A ``header_block_peak_size`` high-water mark is exposed on the
+  internal frame buffer for verifiable buffering accounting.
 
 **Bugfixes**
 
