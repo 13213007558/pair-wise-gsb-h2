@@ -7,6 +7,7 @@ An implementation of a HTTP/2 connection.
 from __future__ import annotations
 
 import base64
+import time
 from enum import Enum, IntEnum
 from typing import TYPE_CHECKING, Any
 
@@ -54,6 +55,7 @@ from .exceptions import (
     NoAvailableStreamIDError,
     NoSuchStreamError,
     ProtocolError,
+    RequestBudgetExhaustedError,
     RFC1122Error,
     StreamClosedError,
     StreamIDTooLowError,
@@ -106,6 +108,45 @@ class ConnectionInputs(Enum):
 class AllowedStreamIDs(IntEnum):
     EVEN = 0
     ODD = 1
+
+
+class _RequestBudget:
+    """
+    A token bucket limiting the rate at which the remote peer may open new
+    request streams on a single connection. Tokens are consumed per newly
+    created request stream, not per currently open stream, and refill at a
+    fixed rate up to the configured capacity. Time comes from a
+    caller-provided monotonic clock.
+    """
+
+    def __init__(self,
+                 capacity: int,
+                 refill_rate: float,
+                 clock: Callable[[], float]) -> None:
+        self._capacity = float(capacity)
+        self._refill_rate = refill_rate
+        self._clock = clock
+        self._tokens = float(capacity)
+        self._last_refill = clock()
+
+    def consume(self) -> bool:
+        """
+        Attempt to consume a single token, first refilling based on the
+        elapsed time. Returns True if a token was available.
+        """
+        now = self._clock()
+        elapsed = now - self._last_refill
+        if elapsed > 0:
+            self._tokens = min(
+                self._capacity,
+                self._tokens + (elapsed * self._refill_rate),
+            )
+            self._last_refill = now
+
+        if self._tokens >= 1.0:
+            self._tokens -= 1.0
+            return True
+        return False
 
 
 class H2ConnectionStateMachine:
@@ -338,6 +379,22 @@ class H2Connection:
         #:
         #: .. versionadded:: 2.5.0
         self.config = config or H2Configuration(client_side=True)
+
+        # The optional connection-level request admission budget. This only
+        # applies to server-side connections, where the remote peer is the
+        # one opening request streams. ``None`` means the budget is disabled
+        # and the original behaviour is preserved.
+        self._request_budget: _RequestBudget | None = None
+        request_budget_capacity = self.config.request_budget_capacity
+        if request_budget_capacity is not None:
+            if self.config.client_side:
+                msg = "Request budgets only apply to server-side connections."
+                raise ValueError(msg)
+            self._request_budget = _RequestBudget(
+                capacity=request_budget_capacity,
+                refill_rate=self.config.request_budget_refill_rate,
+                clock=self.config.budget_clock or time.monotonic,
+            )
 
         # Objects that store settings, including defaults.
         #
@@ -1604,6 +1661,23 @@ class H2Connection:
             if (value + 1) > max_open_streams:
                 msg = f"Max inbound streams is {max_open_streams}, {value} open"
                 raise TooManyStreamsError(msg)
+
+            # If a request admission budget is configured, charge it for
+            # genuinely new request streams only. Trailers and CONTINUATION
+            # frames reference streams that already exist, and retransmitted
+            # or otherwise invalid frames reference stream IDs at or below
+            # the highest one already seen: none of these may consume fresh
+            # credit. When the budget is exhausted we refuse the request
+            # before any event reaches the application.
+            if (self._request_budget is not None
+                    and frame.stream_id > self.highest_inbound_stream_id
+                    and (frame.stream_id % 2) == int(AllowedStreamIDs.ODD)
+                    and not self._request_budget.consume()):
+                msg = (
+                    "Request budget exhausted: refusing new stream "
+                    f"{frame.stream_id}"
+                )
+                raise RequestBudgetExhaustedError(msg)
 
         # Let's decode the headers. We handle headers as bytes internally up
         # until we hang them off the event, at which point we may optionally

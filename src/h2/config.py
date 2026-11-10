@@ -7,7 +7,10 @@ Objects for controlling the configuration of the HTTP/2 stack.
 from __future__ import annotations
 
 import sys
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:  # pragma: no cover
+    from collections.abc import Callable
 
 
 class _BooleanConfigOption:
@@ -149,6 +152,41 @@ class H2Configuration:
         .. versionadded:: 2.6.0
 
     :type logger: ``logging.Logger``
+
+    :param request_budget_capacity: Controls an optional connection-level
+        admission budget for new inbound request streams. Each time the
+        remote peer opens a new request stream, one token is consumed from
+        the budget; when the budget is empty the connection is terminated
+        with a GOAWAY frame carrying the ``ENHANCE_YOUR_CALM`` error code
+        before the request is delivered to the application. This defends
+        against peers that churn through streams (e.g. by resetting them
+        immediately) while staying below the concurrent stream limit.
+        The budget counts newly created request streams, not currently
+        open streams. ``None`` (the default) disables the budget and
+        preserves the original behaviour. This only applies to server-side
+        connections: it is an error to set it for client-side connections.
+
+        .. versionadded:: 4.5.0
+
+    :type request_budget_capacity: ``int`` or ``None``
+
+    :param request_budget_refill_rate: The rate, in tokens per second, at
+        which the request budget refills, up to ``request_budget_capacity``.
+        Defaults to ``0.0``, meaning the budget never refills. Only
+        meaningful when ``request_budget_capacity`` is set.
+
+        .. versionadded:: 4.5.0
+
+    :type request_budget_refill_rate: ``float``
+
+    :param budget_clock: A callable returning the current time in seconds,
+        used to compute budget refills. Must be monotonic. Defaults to
+        ``time.monotonic``. Only meaningful when ``request_budget_capacity``
+        is set.
+
+        .. versionadded:: 4.5.0
+
+    :type budget_clock: ``Callable[[], float]`` or ``None``
     """
 
     client_side = _BooleanConfigOption("client_side")
@@ -176,7 +214,10 @@ class H2Configuration:
                  split_outbound_cookies: bool = False,
                  validate_inbound_headers: bool = True,
                  normalize_inbound_headers: bool = True,
-                 logger: DummyLogger | OutputLogger | None = None) -> None:
+                 logger: DummyLogger | OutputLogger | None = None,
+                 request_budget_capacity: int | None = None,
+                 request_budget_refill_rate: float = 0.0,
+                 budget_clock: Callable[[], float] | None = None) -> None:
         self.client_side = client_side
         self.header_encoding = header_encoding
         self.validate_outbound_headers = validate_outbound_headers
@@ -185,6 +226,57 @@ class H2Configuration:
         self.validate_inbound_headers = validate_inbound_headers
         self.normalize_inbound_headers = normalize_inbound_headers
         self.logger = logger or DummyLogger(__name__)
+        self.request_budget_capacity = request_budget_capacity
+        self.request_budget_refill_rate = request_budget_refill_rate
+        self.budget_clock = budget_clock
+
+    @property
+    def request_budget_capacity(self) -> int | None:
+        return self._request_budget_capacity
+
+    @request_budget_capacity.setter
+    def request_budget_capacity(self, value: int | None) -> None:
+        if value is None:
+            self._request_budget_capacity = None
+            return
+        if not isinstance(value, int):
+            msg = "request_budget_capacity must be an int or None"
+            raise ValueError(msg)  # noqa: TRY004
+        if isinstance(value, bool):
+            msg = "request_budget_capacity must be an int or None"
+            raise ValueError(msg)  # noqa: TRY004
+        if value < 0:
+            msg = "request_budget_capacity must be non-negative"
+            raise ValueError(msg)
+        self._request_budget_capacity = value
+
+    @property
+    def request_budget_refill_rate(self) -> float:
+        return self._request_budget_refill_rate
+
+    @request_budget_refill_rate.setter
+    def request_budget_refill_rate(self, value: float) -> None:
+        if not isinstance(value, (int, float)):
+            msg = "request_budget_refill_rate must be a number"
+            raise ValueError(msg)  # noqa: TRY004
+        if isinstance(value, bool):
+            msg = "request_budget_refill_rate must be a number"
+            raise ValueError(msg)  # noqa: TRY004
+        if value < 0:
+            msg = "request_budget_refill_rate must be non-negative"
+            raise ValueError(msg)
+        self._request_budget_refill_rate = float(value)
+
+    @property
+    def budget_clock(self) -> Callable[[], float] | None:
+        return self._budget_clock
+
+    @budget_clock.setter
+    def budget_clock(self, value: Callable[[], float] | None) -> None:
+        if value is not None and not callable(value):
+            msg = "budget_clock must be callable or None"
+            raise ValueError(msg)
+        self._budget_clock = value
 
     @property
     def header_encoding(self) -> bool | str | None:

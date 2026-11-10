@@ -192,3 +192,14 @@ class DenialOfServiceError(ProtocolError):
     #: The error code corresponds to this kind of
     #: :class:`ProtocolError <h2.exceptions.ProtocolError>`
     error_code = ErrorCodes.ENHANCE_YOUR_CALM
+
+
+class RequestBudgetExhaustedError(DenialOfServiceError):
+    """
+    Emitted when the remote peer opens new request streams faster than the
+    configured connection-level request budget allows. Raised before the
+    request is delivered to the application; the connection is terminated
+    with a GOAWAY frame carrying the ``ENHANCE_YOUR_CALM`` error code.
+
+    .. versionadded:: 4.5.0
+    """

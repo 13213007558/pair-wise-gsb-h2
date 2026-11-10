@@ -11,6 +11,13 @@ dev
 **API Changes (Backward Compatible)**
 
 - Support for Python 3.15 has been added.
+- Added an optional connection-level request admission budget for server-side
+  connections, configured via ``request_budget_capacity``,
+  ``request_budget_refill_rate``, and ``budget_clock`` on
+  ``H2Configuration``. When the budget is exhausted the connection is
+  terminated with a GOAWAY frame carrying ``ENHANCE_YOUR_CALM`` and
+  ``h2.exceptions.RequestBudgetExhaustedError`` is raised, before the
+  request is delivered to the application.
 
 **Bugfixes**
 
